@@ -8,6 +8,8 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+
+import java.security.MessageDigest;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Arrays;
@@ -125,19 +127,14 @@ public class TokenController {
     }
 
     /**
-     * Constant-time string comparison to prevent timing-based client enumeration.
-     * Standard String.equals() short-circuits on the first mismatched character,
-     * leaking information about how many characters are correct.
+     * Constant-time byte comparison to prevent timing-based client enumeration.
+     * Uses MessageDigest.isEqual() which is guaranteed constant-time in the JDK —
+     * it does not short-circuit on length mismatch or character mismatch, so
+     * an attacker cannot determine the length or any characters of the real secret
+     * by measuring response time.
      */
     private boolean constantTimeEquals(String a, String b) {
-        if (a.length() != b.length()) {
-            return false;
-        }
-        int result = 0;
-        for (int i = 0; i < a.length(); i++) {
-            result |= a.charAt(i) ^ b.charAt(i);
-        }
-        return result == 0;
+        return MessageDigest.isEqual(a.getBytes(), b.getBytes());
     }
 
     private record ClientRecord(String secret, List<String> allowedScopes) {}

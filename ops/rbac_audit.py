@@ -232,7 +232,16 @@ def audit_cluster_role_bindings(
         for subject in crb.subjects:
             # Check 2: ServiceAccount subjects — do they exist?
             if subject.kind == "ServiceAccount":
-                sa_ns = subject.namespace or "default"
+                # Subjects in ClusterRoleBindings sometimes have no namespace field set.
+                # For system accounts expressed as `system:serviceaccount:<ns>:<name>`,
+                # the namespace is in the name — parse it rather than assuming "default".
+                if subject.namespace:
+                    sa_ns = subject.namespace
+                elif subject.name.startswith("system:serviceaccount:"):
+                    parts = subject.name.split(":")
+                    sa_ns = parts[2] if len(parts) >= 4 else "default"
+                else:
+                    sa_ns = "default"
                 if (sa_ns, subject.name) not in all_service_accounts:
                     findings.append(Finding(
                         severity="MEDIUM",

@@ -15,7 +15,7 @@ metadata:
 spec:
   hard:
     # CPU: allow up to 4x the per-pod request (headroom for rolling updates)
-    requests.cpu: {{ mulf 4 (trimSuffix "m" .Values.resources.requests.cpu | float64) | printf "%.0fm" }}
+    requests.cpu: {{ mul 4 (trimSuffix "m" .Values.resources.requests.cpu | int) | printf "%dm" }}
     requests.memory: {{ .Values.resources.requests.memory }}
     limits.cpu: {{ .Values.resources.limits.cpu }}
     limits.memory: {{ .Values.resources.limits.memory }}

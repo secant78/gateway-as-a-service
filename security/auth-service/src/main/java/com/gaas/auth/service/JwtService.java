@@ -160,9 +160,13 @@ public class JwtService {
         byte[] keyBytes = Base64.getDecoder().decode(base64Key);
         signingKey.set(Keys.hmacShaKeyFor(keyBytes));
 
-        Object version = data.get("metadata") instanceof Map
-                ? ((Map<?, ?>) data.get("metadata")).get("version")
-                : null;
-        currentKeyVersion = version != null ? Integer.parseInt(version.toString()) : currentKeyVersion + 1;
+        // Extract version from VaultResponse metadata (not from the data map).
+        // Spring Vault's VaultResponse.getMetadata() is the correct location for
+        // KV v2 version info — data.get("metadata") is always null here.
+        if (response.getMetadata() != null && response.getMetadata().get("version") != null) {
+            currentKeyVersion = Integer.parseInt(response.getMetadata().get("version").toString());
+        } else {
+            currentKeyVersion = currentKeyVersion + 1;
+        }
     }
 }
