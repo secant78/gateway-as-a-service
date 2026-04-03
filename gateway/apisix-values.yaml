@@ -1,0 +1,87 @@
+# ============================================================
+# APISIX Helm Values — GaaS Gateway Layer
+# ============================================================
+# Install command:
+#   helm repo add apisix https://charts.apiseven.com
+#   helm repo update
+#   helm install apisix apisix/apisix \
+#     --namespace gaas \
+#     --create-namespace \
+#     -f apisix-values.yaml
+#
+# DESIGN DECISION: NodePort for Minikube vs LoadBalancer for cloud
+#   Minikube does not resolve `LoadBalancer` IPs without running
+#   `minikube tunnel` as a background daemon. NodePort is reliable
+#   and predictable on Minikube. For cloud deployments, Terraform
+#   provisions an ALB that forwards traffic to this NodePort.
+# ============================================================
+
+apisix:
+  enabled: true
+  replicaCount: 1
+
+  podAnnotations:
+    # Belt-and-suspenders: namespace label already enables Istio injection,
+    # but this annotation ensures APISIX pods are explicitly included.
+    # Without the Istio sidecar, APISIX traffic is not covered by the
+    # PeerAuthentication STRICT mTLS policy.
+    sidecar.istio.io/inject: "true"
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+  # APISIX admin API — protected, accessible only within the cluster
+  admin:
+    enabled: true
+    type: ClusterIP
+    port: 9180
+    # Restrict admin access to cluster-internal traffic only
+    allow:
+      ipList:
+        - 127.0.0.1
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+
+# Gateway (data plane): the entry point for all tenant API traffic
+gateway:
+  # NodePort for Minikube compatibility (see design decision above).
+  # Change to `LoadBalancer` when deploying to EKS/AKS with Terraform ALB.
+  type: NodePort
+  http:
+    enabled: true
+    servicePort: 80
+    containerPort: 9080
+    nodePort: 30080  # Fixed port so Terraform ALB target group is stable
+  tls:
+    enabled: false   # TLS terminated at the ALB (Terraform) layer
+
+# Ingress controller: allows using standard Kubernetes Ingress resources
+# alongside APISIX-native ApisixRoute resources
+ingress-controller:
+  enabled: true
+  config:
+    apisix:
+      adminKey: "gaas-admin-key-change-me"  # Override via K8s Secret in CI
+      serviceNamespace: gaas
+
+# Embedded etcd: acceptable for demo/dev — not HA
+# For production: point to an external etcd cluster or use APISIX's
+# standalone mode (etcd-less, config stored in SQLite)
+etcd:
+  enabled: true
+  replicaCount: 1
+  persistence:
+    enabled: false  # Ephemeral — acceptable for Minikube CI runs
+
+# Dashboard is disabled here and deployed separately via apisix-dashboard-config.yaml.
+# Reason: the dashboard has its own auth model and should be gated independently
+# from the data-plane gateway. Deploying it separately allows applying a
+# stricter NetworkPolicy to the dashboard pod.
+dashboard:
+  enabled: false

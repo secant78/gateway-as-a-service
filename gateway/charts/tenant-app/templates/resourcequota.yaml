@@ -1,0 +1,25 @@
+# ResourceQuota enforces namespace-level resource limits.
+# This prevents a single tenant from exhausting cluster capacity
+# even if they set very high limits in their own Pod specs.
+# The quota values mirror the per-pod limits so a single-replica
+# deployment can always schedule, while preventing uncontrolled scaling.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ .Release.Name }}-quota
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
+    app.kubernetes.io/part-of: gaas
+    gaas/tenant-id: {{ required "tenantId is required" .Values.tenantId | quote }}
+spec:
+  hard:
+    # CPU: allow up to 4x the per-pod request (headroom for rolling updates)
+    requests.cpu: {{ mulf 4 (trimSuffix "m" .Values.resources.requests.cpu | float64) | printf "%.0fm" }}
+    requests.memory: {{ .Values.resources.requests.memory }}
+    limits.cpu: {{ .Values.resources.limits.cpu }}
+    limits.memory: {{ .Values.resources.limits.memory }}
+    # Prevent unbounded pod proliferation
+    pods: "5"
+    services: "3"
+    persistentvolumeclaims: "2"

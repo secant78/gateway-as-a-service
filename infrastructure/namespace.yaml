@@ -1,0 +1,27 @@
+---
+# Namespace for all GaaS core workloads.
+# The istio-injection label causes the Istio control plane to automatically
+# inject the Envoy sidecar proxy into every Pod created in this namespace.
+# This label MUST be present before any Pods are scheduled here, because
+# injection happens at admission time — existing Pods are not retroactively injected.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gaas
+  labels:
+    istio-injection: enabled
+    app.kubernetes.io/part-of: gaas
+    environment: production
+
+---
+# Vault runs in its own namespace to limit blast radius.
+# A compromised workload in `gaas` cannot directly access Vault's API
+# without crossing a namespace boundary guarded by NetworkPolicy.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gaas-vault
+  labels:
+    istio-injection: enabled
+    app.kubernetes.io/part-of: gaas
+    environment: production

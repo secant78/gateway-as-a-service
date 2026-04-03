@@ -1,0 +1,19 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-tenant-rolebinding
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
+    app.kubernetes.io/part-of: gaas
+    gaas/tenant-id: {{ required "tenantId is required" .Values.tenantId | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  # Must match the Role name created in role.yaml exactly
+  name: {{ .Release.Name }}-tenant-role
+subjects:
+  - kind: ServiceAccount
+    # Must match the ServiceAccount name created in serviceaccount.yaml exactly
+    name: {{ default (printf "%s-sa" .Release.Name) .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}

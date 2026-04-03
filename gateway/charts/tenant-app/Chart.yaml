@@ -1,0 +1,21 @@
+apiVersion: v2
+name: tenant-app
+version: 0.1.0
+appVersion: "1.0"
+description: >
+  Standardized Helm chart for GaaS Tenant Application deployments.
+  Provides pre-configured RBAC (namespace-scoped Role + RoleBinding),
+  dedicated ServiceAccount, and enforced resource limits via ResourceQuota.
+  Tenants are isolated by namespace — one Helm release per tenant namespace.
+
+type: application
+
+keywords:
+  - gaas
+  - tenant
+  - gateway-as-a-service
+  - rbac
+
+maintainers:
+  - name: GaaS Platform Team
+    email: platform@gaas.internal

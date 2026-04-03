@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-svc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
+    app.kubernetes.io/part-of: gaas
+    gaas/tenant-id: {{ required "tenantId is required" .Values.tenantId | quote }}
+spec:
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.port }}
+      protocol: TCP
+  type: {{ .Values.service.type }}
+
+{{- if .Values.apisixRoute.enabled }}
+---
+# ApisixRoute: configures APISIX to route traffic to this tenant's service.
+# The pathPrefix determines where in the APISIX gateway this tenant's APIs appear.
+# Example: pathPrefix "/tenants/acme-corp" exposes the tenant at
+#          http://<gateway>/tenants/acme-corp/*
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: {{ .Release.Name }}-route
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
+    app.kubernetes.io/part-of: gaas
+    gaas/tenant-id: {{ .Values.tenantId | quote }}
+spec:
+  http:
+    - name: tenant-route
+      match:
+        paths:
+          - {{ required "apisixRoute.pathPrefix is required when apisixRoute.enabled=true" .Values.apisixRoute.pathPrefix }}/*
+        methods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - PATCH
+      backends:
+        - serviceName: {{ .Release.Name }}-svc
+          servicePort: {{ .Values.service.port }}
+      plugins:
+        # JWT verification plugin — validates tokens issued by the GaaS auth-service
+        - name: jwt-auth
+          enable: true
+          config:
+            key: "gaas-jwt"  # References an APISIX Consumer configured with the public key
+{{- end }}

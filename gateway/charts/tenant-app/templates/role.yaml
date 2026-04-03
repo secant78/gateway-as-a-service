@@ -1,0 +1,16 @@
+# SECURITY: This is a namespace-scoped Role, NOT a ClusterRole.
+# Tenants must never have cluster-wide permissions. A ClusterRole would allow
+# a misconfigured or compromised tenant to enumerate resources across all namespaces.
+# The RBAC audit script (ops/rbac_audit.py) flags any ClusterRoleBinding
+# that grants permissions to a ServiceAccount in the `gaas` namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-tenant-role
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
+    app.kubernetes.io/part-of: gaas
+    gaas/tenant-id: {{ required "tenantId is required" .Values.tenantId | quote }}
+rules:
+{{- toYaml .Values.rbac.rules | nindent 2 }}

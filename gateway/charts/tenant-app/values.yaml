@@ -1,0 +1,80 @@
+# ============================================================
+# Tenant App Helm Chart — Default Values
+# ============================================================
+# Override per tenant by passing -f tenant-<id>-values.yaml or
+# using --set flags in the Helm install command.
+#
+# REQUIRED OVERRIDES (no default — must be specified per release):
+#   tenantId        — unique tenant identifier, used in all resource names
+#   image.repository — the tenant's container image repository
+# ============================================================
+
+# tenantId MUST be overridden per release. It is used as a label and as a
+# suffix in resource names to keep tenants isolated within their namespace.
+# Example: tenantId: "acme-corp"
+tenantId: ""
+
+replicaCount: 1
+
+image:
+  repository: ""         # REQUIRED — e.g., gcr.io/tenant-project/app
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# ---- Resource Limits ----
+# These are enforced at two layers:
+#   1. The Deployment's container spec (per-pod enforcement by kubelet)
+#   2. The ResourceQuota (namespace-level enforcement by the API server)
+# Both must be set to prevent resource exhaustion by a rogue or misconfigured tenant.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# ---- RBAC ----
+# The Role grants the tenant's ServiceAccount access to specific API resources.
+# SECURITY: Only namespace-scoped Role is created — never ClusterRole.
+# Tenants cannot enumerate resources in other namespaces.
+rbac:
+  rules:
+    # Default: read-only on pods and services in the tenant's own namespace
+    - apiGroups: [""]
+      resources: ["pods", "services", "configmaps"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: ["apps"]
+      resources: ["deployments", "replicasets"]
+      verbs: ["get", "list", "watch"]
+
+# ---- Service Account ----
+serviceAccount:
+  create: true
+  # Name defaults to <release-name>-sa if not overridden
+  name: ""
+  annotations: {}
+
+# ---- Service ----
+service:
+  type: ClusterIP
+  port: 8080
+
+# ---- APISIX Route ----
+# Configures an ApisixRoute so APISIX forwards traffic from the tenant's
+# path prefix to this deployment's service.
+apisixRoute:
+  enabled: true
+  # The path prefix under which this tenant's APIs are exposed.
+  # Example: pathPrefix: "/tenants/acme-corp"
+  pathPrefix: ""
+  # Target upstream host — defaults to the service name within the namespace
+  upstreamHost: ""
+
+# ---- Pod Labels ----
+podLabels:
+  app.kubernetes.io/part-of: gaas
+
+# ---- Pod Annotations ----
+podAnnotations:
+  sidecar.istio.io/inject: "true"

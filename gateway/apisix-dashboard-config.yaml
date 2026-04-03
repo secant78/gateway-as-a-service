@@ -1,0 +1,128 @@
+---
+# APISIX Dashboard Admin Password Secret
+# The password is injected via a K8s Secret rather than hardcoded in the
+# ConfigMap, so that the ConfigMap can be committed to git safely.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: apisix-dashboard-admin
+  namespace: gaas
+  labels:
+    app: apisix-dashboard
+    app.kubernetes.io/part-of: gaas
+type: Opaque
+stringData:
+  # CHANGE THIS in production. The value here is a placeholder.
+  # Generate with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+  admin-password: "gaas-dashboard-password-change-me"
+
+---
+# Dashboard configuration (conf.yaml) stored as a ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apisix-dashboard-config
+  namespace: gaas
+  labels:
+    app: apisix-dashboard
+    app.kubernetes.io/part-of: gaas
+data:
+  conf.yaml: |
+    conf:
+      listen:
+        host: 0.0.0.0
+        port: 9000
+      log:
+        error_log:
+          level: warn
+          file_path: /dev/stderr
+        access_log:
+          file_path: /dev/stdout
+      etcd:
+        endpoints:
+          - apisix-etcd:2379
+        mtls:
+          ca_file: ""
+          cert_file: ""
+          key_file: ""
+        prefix: /apisix
+        username: ""
+        password: ""
+
+    authentication:
+      # Dashboard has its own login — users authenticate here to see the API-as-a-Service view
+      secret: gaas-dashboard-jwt-secret-change-me
+      expire_time: 3600
+      users:
+        - username: admin
+          # Password is read from the Secret mounted at /etc/dashboard/admin-password
+          # The entrypoint script sets this at runtime — not hardcoded here.
+          password: "$(DASHBOARD_ADMIN_PASSWORD)"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apisix-dashboard
+  namespace: gaas
+  labels:
+    app: apisix-dashboard
+    app.kubernetes.io/part-of: gaas
+    app.kubernetes.io/version: "3.0.1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: apisix-dashboard
+  template:
+    metadata:
+      labels:
+        app: apisix-dashboard
+      annotations:
+        sidecar.istio.io/inject: "true"
+    spec:
+      containers:
+        - name: apisix-dashboard
+          image: apache/apisix-dashboard:3.0.1-alpine
+          ports:
+            - containerPort: 9000
+              name: dashboard
+          env:
+            - name: DASHBOARD_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: apisix-dashboard-admin
+                  key: admin-password
+          volumeMounts:
+            - name: config
+              mountPath: /usr/local/apisix-dashboard/conf/conf.yaml
+              subPath: conf.yaml
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: config
+          configMap:
+            name: apisix-dashboard-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apisix-dashboard
+  namespace: gaas
+  labels:
+    app: apisix-dashboard
+    app.kubernetes.io/part-of: gaas
+spec:
+  selector:
+    app: apisix-dashboard
+  ports:
+    - name: dashboard
+      port: 9000
+      targetPort: 9000
+  type: ClusterIP
