@@ -224,6 +224,78 @@ public class JwtService {
     }
 
     /**
+     * Issues a GaaS JWT enriched with Identity Provider claims.
+     *
+     * This method is called by BOTH TokenController (M2M Client Credentials) and
+     * AuthorizationController (U2M Authorization Code). The resulting JWT is the
+     * single unified token format that APISIX's jwt-auth plugin validates.
+     *
+     * DIFFERENCE vs issueToken():
+     *   issueToken() was the original method for the mock auth service — it had no IdP.
+     *   issueFromIdpClaims() is the production method that enriches the JWT with:
+     *     - idp_sub:    The IdP's stable subject identifier (for audit correlation)
+     *     - mfa:        Whether MFA was completed (true for U2M after OTP, false for M2M)
+     *     - auth_flow:  Which OAuth grant was used ("client_credentials" or "authorization_code")
+     *     - email:      User's email (U2M only; null for M2M machine clients)
+     *
+     * TOKEN CLAIMS EXPLAINED:
+     *   jti         → UUID — prevents token replay. Each token has a unique ID.
+     *                 If APISIX is configured with a jti cache, replayed tokens are rejected.
+     *   iss         → issuer (from gaas.jwt.issuer) — identifies THIS auth service.
+     *   sub         → subjectId (clientId for M2M, preferredUsername for U2M)
+     *   aud         → audience ("gaas-api-gateway") — token is only valid at APISIX.
+     *   iat         → issued at (current time)
+     *   exp         → expiry (current time + gaas.jwt.expiry-seconds, typically 3600s)
+     *   scope       → space-joined granted scopes ("gateway:read gateway:admin")
+     *   grant_type  → "client_credentials" or "authorization_code"
+     *   idp_sub     → Keycloak's `sub` claim — stable even if username changes
+     *   mfa         → boolean — whether MFA was completed. Downstream services can
+     *                 enforce MFA for specific operations by checking this claim.
+     *   email       → user's email (U2M only). Useful for logging and user identification
+     *                 in tenant applications without requiring a userinfo lookup.
+     *
+     * THREAD SAFETY:
+     *   This method reads signingKey.get() which is an AtomicReference — lock-free read.
+     *   Multiple threads can call this simultaneously without blocking.
+     *
+     * @param subjectId     JWT sub claim — clientId (M2M) or preferredUsername (U2M)
+     * @param scopes        Granted OAuth scopes from Keycloak
+     * @param authFlow      OAuth grant type: "client_credentials" or "authorization_code"
+     * @param idpSubject    Keycloak's stable subject ID — embedded as `idp_sub` claim
+     * @param mfaCompleted  true if user completed OTP/WebAuthn MFA; false for M2M
+     * @param email         User's email address; null for M2M machine clients
+     * @return              Compact GaaS JWT string (header.payload.signature)
+     */
+    public String issueFromIdpClaims(
+            String subjectId,
+            List<String> scopes,
+            String authFlow,
+            String idpSubject,
+            boolean mfaCompleted,
+            String email) {
+
+        Instant now    = Instant.now();
+        Instant expiry = now.plusSeconds(expirySeconds);
+
+        return Jwts.builder()
+            .id(UUID.randomUUID().toString())           // jti: unique token ID, prevents replay
+            .issuer(issuer)                              // iss: "https://gaas.internal"
+            .subject(subjectId)                          // sub: clientId or preferredUsername
+            .audience().add(audience).and()              // aud: "gaas-api-gateway"
+            .issuedAt(Date.from(now))                    // iat: current timestamp
+            .expiration(Date.from(expiry))               // exp: now + expirySeconds
+            .claim("scope", String.join(" ", scopes))    // space-delimited granted scopes
+            .claim("grant_type", authFlow)               // which OAuth flow was used
+            .claim("idp_sub", idpSubject)                // Keycloak's stable subject ID
+            .claim("mfa", mfaCompleted)                  // was MFA completed? boolean
+            // Email: include if present, otherwise omit the claim entirely.
+            // An empty string in the `email` claim is misleading — null means "not applicable".
+            .claim("email", email != null && !email.isBlank() ? email : null)
+            .signWith(signingKey.get())                  // HMAC-SHA256 with the Vault-managed key
+            .compact();                                  // "xxxxx.yyyyy.zzzzz"
+    }
+
+    /**
      * Polls Vault every 30 minutes to detect signing key rotation.
      *
      * HOW IT WORKS:

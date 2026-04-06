@@ -71,3 +71,35 @@ metadata:
     istio-injection: enabled
     app.kubernetes.io/part-of: gaas
     environment: production
+
+---
+# Identity Provider namespace — isolated from gaas for blast-radius containment.
+#
+# WHY A SEPARATE NAMESPACE FOR KEYCLOAK?
+#   Keycloak is the authentication authority for ALL of GaaS. If it were in the same
+#   namespace as tenant workloads, a compromised tenant pod could potentially:
+#   - Send traffic to Keycloak using its SPIFFE identity (if RBAC is misconfigured)
+#   - Observe Keycloak's network traffic via a rogue sidecar
+#   Isolation in gaas-idp means RBAC, NetworkPolicy, and Istio AuthorizationPolicy
+#   can all be scoped to allow ONLY the auth-service (in gaas namespace) to reach Keycloak.
+#
+# ISTIO INJECTION:
+#   Keycloak pods get the Envoy sidecar. This enables:
+#   - STRICT mTLS (see keycloak-peer-authentication.yaml) — only Istio-identified
+#     services can send traffic to Keycloak
+#   - The auth-service is the only service whose SPIFFE identity should be allowed
+#     through. This can be enforced with an Istio AuthorizationPolicy.
+#
+# HOW TO VERIFY INJECTION:
+#   kubectl get pods -n gaas-idp
+#   → Look for 2/2 READY (Keycloak container + Envoy sidecar = 2 containers per pod)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gaas-idp
+  labels:
+    # Enables automatic Envoy sidecar injection for all pods in this namespace.
+    # Apply this namespace BEFORE deploying Keycloak to ensure the sidecar is injected.
+    istio-injection: enabled
+    app.kubernetes.io/part-of: gaas
+    environment: production

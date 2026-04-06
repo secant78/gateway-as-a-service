@@ -28,6 +28,16 @@ import org.springframework.security.config.http.SessionCreationPolicy;
 // servlet filters that Spring Security applies to every incoming HTTP request.
 import org.springframework.security.web.SecurityFilterChain;
 
+// @EnableConfigurationProperties activates @ConfigurationProperties scanning.
+// Without this, Spring does not bind gaas.idp.* properties into IdpProperties.
+// Placed here (on a @Configuration class) rather than on AuthServiceApplication
+// to keep it co-located with the security configuration that uses IdP settings.
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+
+// IdpProperties is the @ConfigurationProperties record for gaas.idp.* settings.
+// This import + @EnableConfigurationProperties makes it available as a Spring bean.
+import com.gaas.auth.config.IdpProperties;
+
 /**
  * ============================================================
  * Spring Security Configuration for GaaS Auth Service
@@ -71,8 +81,12 @@ import org.springframework.security.web.SecurityFilterChain;
  *   - The AI draft protected /actuator/health, which would block Kubernetes liveness
  *     and readiness probes, causing pods to be killed in a crash loop. Fixed manually.
  */
+// @EnableConfigurationProperties: activates IdpProperties as a Spring-managed bean.
+// Spring reads all gaas.idp.* properties from application.properties and binds them
+// into the IdpProperties record. Without this, IdpProperties cannot be injected.
 @Configuration
 @EnableWebSecurity
+@EnableConfigurationProperties(IdpProperties.class)
 public class SecurityConfig {
 
     /**
@@ -103,19 +117,54 @@ public class SecurityConfig {
             // Rules are evaluated in order — first matching rule wins.
             .authorizeHttpRequests(authz -> authz
 
-                // /oauth2/token is the token issuance endpoint itself.
-                // Clients must be able to call this WITHOUT a token — it's how they get one.
+                // ---- PUBLIC ENDPOINTS (no token required) ----
+
+                // /oauth2/token is the M2M token issuance endpoint.
+                // Machine clients call this with client_id + client_secret to get a JWT.
                 // Protecting it would make it impossible to obtain a token (catch-22).
                 .requestMatchers("/oauth2/token").permitAll()
 
+                // /auth/authorize starts the U2M Authorization Code + PKCE flow.
+                // Called by user-facing apps before login — no token exists yet.
+                // This endpoint redirects the user's browser to Keycloak login.
+                .requestMatchers("/auth/authorize").permitAll()
+
+                // /auth/callback receives the authorization code from Keycloak.
+                // Keycloak redirects the user's browser here after successful login.
+                // No authentication token required — the auth code IS the authentication.
+                .requestMatchers("/auth/callback").permitAll()
+
                 // Kubernetes kubelet calls /actuator/health as a liveness and readiness probe.
-                // If this endpoint requires a token, the kubelet probe fails, and Kubernetes
-                // will restart the pod in an infinite loop. Must always be public.
+                // If this endpoint requires a token, the kubelet probe fails and the pod
+                // enters a crash loop. Must always be public.
                 .requestMatchers("/actuator/health", "/actuator/info").permitAll()
 
-                // All other endpoints (e.g., a future /oauth2/introspect or admin endpoint)
-                // require a valid JWT Bearer token. This is a safe default.
+                // ---- PROTECTED ENDPOINTS (Keycloak JWT Bearer token required) ----
+                // All other endpoints require a valid JWT Bearer token from Keycloak.
+                // Spring Security validates the token against Keycloak's JWKS endpoint
+                // (configured in application.properties:
+                //   spring.security.oauth2.resourceserver.jwt.jwk-set-uri).
+                // This protects any future admin or management endpoints added to the service.
                 .anyRequest().authenticated()
+            )
+
+            // ---- JWT Resource Server configuration ----
+            // Activates JWT Bearer token validation for protected endpoints.
+            // When a request arrives with: Authorization: Bearer <token>
+            //   1. Spring Security fetches Keycloak's public keys from jwk-set-uri
+            //   2. Verifies the JWT signature with the matching RSA/EC key
+            //   3. Validates exp, iss, aud claims
+            //   4. Sets the authenticated principal in SecurityContext
+            //
+            // The JWT decoder is auto-configured from application.properties:
+            //   spring.security.oauth2.resourceserver.jwt.jwk-set-uri=<keycloak-jwks>
+            // No additional configuration needed here — Spring Boot handles discovery.
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> {
+                    // JWT decoder auto-configured from spring.security.oauth2.resourceserver.jwt.*
+                    // If we needed custom claim validation (e.g., checking a custom `tenant_id`
+                    // claim), we could add a JwtDecoder bean here with custom validators.
+                })
             )
 
             // Disable HTTP Basic authentication entirely.

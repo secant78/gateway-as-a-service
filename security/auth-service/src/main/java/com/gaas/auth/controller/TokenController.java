@@ -1,33 +1,31 @@
 package com.gaas.auth.controller;
 
-// JwtService handles all JWT signing logic and Vault key management.
-// TokenController delegates token creation here — it only handles HTTP concerns.
+// IdpTokenService: delegates M2M credential validation to Keycloak.
+// Replaced the previous in-memory CLIENT_REGISTRY with real IdP validation.
+import com.gaas.auth.service.IdpTokenService;
+
+// IdpTokenResponse: typed response from Keycloak's token endpoint.
+// Contains the access_token (from Keycloak), scope, and expiry.
+import com.gaas.auth.model.IdpTokenResponse;
+
+// MfaValidationException: thrown by IdpTokenService when high-privilege scopes
+// are requested but the IdP token lacks an MFA factor in the `amr` claim.
+// For M2M, this exception is not thrown (MFA is not applicable to machines).
+import com.gaas.auth.model.MfaValidationException;
+
+// JwtService: issues the GaaS-specific JWT signed with the Vault HMAC key.
+// After IdP validation, we re-issue a GaaS JWT so all downstream services
+// use a uniformly-formatted, Vault-key-signed token regardless of grant type.
 import com.gaas.auth.service.JwtService;
 
-// SLF4J logger — writes structured log messages (INFO, WARN, ERROR) to stdout.
-// In Kubernetes, stdout is captured by the container runtime and forwarded to your
-// logging stack (e.g., Fluentd → Elasticsearch). Never use System.out.println() in production.
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-// Spring HTTP response status and body types
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-
-// @PostMapping maps this method to POST /oauth2/token
 import org.springframework.web.bind.annotation.PostMapping;
-
-// @RequestParam extracts individual fields from the form-encoded request body
 import org.springframework.web.bind.annotation.RequestParam;
-
-// MessageDigest.isEqual provides the constant-time byte comparison we use for secrets.
-// The JDK guarantees this method runs in O(n) time regardless of where bytes differ,
-// preventing timing-based attacks that could reveal the real secret character by character.
-import java.security.MessageDigest;
-
-// @RestController combines @Controller + @ResponseBody.
-// All return values are automatically serialized to JSON and written to the HTTP response body.
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Arrays;
@@ -36,113 +34,102 @@ import java.util.Map;
 
 /**
  * ============================================================
- * OAuth 2.0 Token Endpoint — Client Credentials Grant (RFC 6749 §4.4)
+ * OAuth 2.0 Token Endpoint — M2M Client Credentials Grant (RFC 6749 §4.4)
  * ============================================================
  *
  * PURPOSE:
- *   This is the only public-facing endpoint of the auth service.
- *   It validates a client's identity and issues a signed JWT that the
- *   client presents to APISIX's jwt-auth plugin on subsequent API calls.
+ *   Provides the POST /oauth2/token endpoint for Machine-to-Machine (M2M) token issuance.
+ *   Machine clients (APISIX gateway, tenant apps, CI pipeline) authenticate here
+ *   using client_id + client_secret to receive a signed JWT.
  *
- * WHAT IS CLIENT CREDENTIALS GRANT?
- *   It is the OAuth 2.0 flow for machine-to-machine authentication where
- *   no human user is involved. Instead of a username + password, the "user"
- *   is a machine client identified by client_id and client_secret.
- *   The client exchanges these credentials directly for an access token.
+ * ARCHITECTURE (before vs. after IdP integration):
  *
- *   Flow:
- *     Client ──POST /oauth2/token──► TokenController ──► JwtService ──► Signed JWT
- *             (client_id, secret)                        (builds claims, signs with Vault key)
+ *   BEFORE (mock auth service):
+ *     Client → POST /oauth2/token
+ *     TokenController validates against in-memory CLIENT_REGISTRY (HashMap)
+ *     TokenController → JwtService.issueToken() → GaaS JWT
  *
- * REQUEST FORMAT (application/x-www-form-urlencoded):
+ *   AFTER (IdP-integrated):
+ *     Client → POST /oauth2/token
+ *     TokenController → IdpTokenService.performClientCredentials()
+ *                              ↓ POST to Keycloak token endpoint
+ *                     [Keycloak validates client_id + client_secret]
+ *                              ↓ IdP access token (if valid)
+ *     TokenController → check AMR for high-privilege scopes (M2M: always passes)
+ *     TokenController → JwtService.issueFromIdpClaims() → GaaS JWT
+ *     Client ← HTTP 200 {"access_token": "<GaaS JWT>"}
+ *
+ * WHY RE-ISSUE A GAAS JWT INSTEAD OF USING THE KEYCLOAK TOKEN DIRECTLY?
+ *   1. Vendor independence: APISIX's jwt-auth plugin uses the Vault-signed HMAC key.
+ *      If we switched IdPs, no APISIX configuration would need to change.
+ *   2. Claim enrichment: The GaaS JWT can carry GaaS-specific claims (idp_sub, mfa,
+ *      grant_type) that Keycloak tokens don't have.
+ *   3. Uniform validation: All tokens — regardless of grant type — are validated by
+ *      APISIX using the same jwt-auth plugin and ApisixConsumer config.
+ *   4. Key rotation: The Vault key is rotated independently of Keycloak's RSA keys.
+ *      Auth service picks up the new key every 30 minutes.
+ *
+ * U2M FLOW:
+ *   The Authorization Code + PKCE flow is handled by AuthorizationController.java.
+ *   This controller handles ONLY the Client Credentials grant (machine-to-machine).
+ *
+ * REQUEST FORMAT (application/x-www-form-urlencoded per RFC 6749 §4.4.2):
  *   grant_type=client_credentials
  *   &client_id=gaas-gateway
  *   &client_secret=gateway-secret-change-me
- *   &scope=gateway:read gateway:admin    ← optional; defaults to all allowed scopes
+ *   &scope=gateway:read gateway:admin    ← optional
  *
- * SUCCESS RESPONSE (200 OK, application/json):
+ * SUCCESS RESPONSE (200 OK):
  *   {
- *     "access_token": "<compact JWT string>",
+ *     "access_token": "<GaaS JWT — Vault HMAC signed>",
  *     "token_type": "Bearer",
  *     "expires_in": 3600,
  *     "scope": "gateway:read gateway:admin"
  *   }
  *
- * ERROR RESPONSES (per RFC 6749):
- *   400 unsupported_grant_type — wrong grant_type parameter
- *   401 invalid_client         — wrong client_id or client_secret
- *   403 insufficient_scope     — requested scope not allowed for this client
- *
- * CLIENT REGISTRY (IN-MEMORY):
- *   Three demo clients are pre-registered:
- *     gaas-gateway   → scopes: gateway:read, gateway:admin
- *     tenant-app-001 → scopes: api:read
- *     ci-pipeline    → scopes: api:read, api:write
- *   In production: replace with a database table or Vault KV-backed store.
- *
- * SECURITY NOTES:
- *   - Client secrets are compared using MessageDigest.isEqual() (constant-time)
- *     to prevent timing attacks that could reveal how many characters of the
- *     secret are correct. See constantTimeEquals() for details.
- *   - Scopes are validated against the client's registered allowed list.
- *     A client cannot request more scopes than it was granted at registration time.
- *
- * ACCOUNTABILITY NOTE (AI-generated code review):
- *   - Constant-time comparison: original AI draft used String.equals() which
- *     short-circuits. Replaced with MessageDigest.isEqual().
- *   - Scope validation: AI draft returned tokens without checking whether the
- *     requested scopes were within the client's allowed set. Added manually.
- *   - Client registry: AI draft used a plain HashMap without making it final/static.
- *     Made it a static final immutable Map.of() to prevent accidental mutation.
+ * ERROR RESPONSES (RFC 6749 §5.2):
+ *   400 unsupported_grant_type — grant_type != client_credentials
+ *   401 invalid_client         — Keycloak rejected the client credentials
+ *   403 mfa_required           — high-privilege scope requested without MFA (M2M: won't happen)
+ *   503 idp_unavailable        — Keycloak is unreachable
  */
 @RestController
 public class TokenController {
 
-    // Logger instance scoped to this class — log messages will include the fully
-    // qualified class name, making it easy to filter logs in production.
     private static final Logger log = LoggerFactory.getLogger(TokenController.class);
 
-    /**
-     * In-memory client registry mapping client_id → credentials + allowed scopes.
-     *
-     * Map.of() creates an immutable map — any attempt to call .put() at runtime
-     * throws UnsupportedOperationException, preventing accidental client registration
-     * bugs during request handling.
-     *
-     * PRODUCTION NOTE: Replace this with a database lookup or Vault KV store.
-     * The secrets here are placeholder values — change them before any real deployment.
-     */
-    private static final Map<String, ClientRecord> CLIENT_REGISTRY = Map.of(
-            // The APISIX gateway itself uses this identity to call protected admin APIs
-            "gaas-gateway", new ClientRecord("gateway-secret-change-me", List.of("gateway:read", "gateway:admin")),
-            // A sample tenant application with read-only access
-            "tenant-app-001", new ClientRecord("tenant-secret-change-me", List.of("api:read")),
-            // The CI pipeline uses this identity for integration tests and deployments
-            "ci-pipeline", new ClientRecord("ci-secret-change-me", List.of("api:read", "api:write"))
-    );
+    // IdpTokenService: the new integration point with Keycloak.
+    // Replaces the in-memory CLIENT_REGISTRY from the mock auth service.
+    // All credential validation now happens at the IdP level.
+    private final IdpTokenService idpTokenService;
 
-    // JwtService is injected by Spring's constructor injection (preferred over @Autowired field injection
-    // because it makes the dependency explicit and enables easier unit testing with mocks).
+    // JwtService: issues the final GaaS JWT after IdP validation.
+    // The JWT is signed with the Vault-managed HMAC-SHA256 key.
     private final JwtService jwtService;
 
-    public TokenController(JwtService jwtService) {
+    // Constructor injection: both dependencies are required.
+    // Spring detects @RestController and injects these via the constructor.
+    public TokenController(IdpTokenService idpTokenService, JwtService jwtService) {
+        this.idpTokenService = idpTokenService;
         this.jwtService = jwtService;
     }
 
     /**
-     * POST /oauth2/token — issues a JWT for a validated client.
+     * POST /oauth2/token — issues a GaaS JWT for a validated M2M client.
      *
-     * Spring maps this to the POST /oauth2/token URL.
-     * - consumes = FORM_URLENCODED: the request body must be form-encoded (not JSON)
-     *   per the OAuth 2.0 spec (RFC 6749 §4.4.2)
-     * - produces = JSON: the response body is always JSON regardless of the Accept header
+     * This endpoint:
+     *   1. Validates grant_type is "client_credentials"
+     *   2. Delegates credential validation to Keycloak via IdpTokenService
+     *   3. Parses the IdP token to extract granted scopes and subject
+     *   4. (For M2M: MFA check always passes — machines can't do OTP)
+     *   5. Re-issues a GaaS JWT (Vault-signed) with enriched claims
      *
-     * @param grantType    Must be "client_credentials" — the only supported grant
-     * @param clientId     The machine client's unique identifier
-     * @param clientSecret The client's secret (compared in constant time)
-     * @param scopeParam   Optional space-delimited list of requested scopes;
-     *                     defaults to all scopes the client is allowed
-     * @return ResponseEntity containing the token JSON body and appropriate HTTP status
+     * @param grantType    Must be "client_credentials" — only supported grant for M2M
+     * @param clientId     The machine client's ID (e.g., "gaas-gateway")
+     * @param clientSecret The machine client's secret (validated by Keycloak)
+     * @param scopeParam   Optional space-delimited requested scopes; Keycloak enforces
+     *                     that the client can only request scopes it was granted
+     * @return ResponseEntity with GaaS JWT on success, or RFC 6749 error on failure
      */
     @PostMapping(
             value = "/oauth2/token",
@@ -150,110 +137,140 @@ public class TokenController {
             produces = MediaType.APPLICATION_JSON_VALUE
     )
     public ResponseEntity<Map<String, Object>> issueToken(
-            @RequestParam("grant_type") String grantType,
-            @RequestParam("client_id") String clientId,
+            @RequestParam("grant_type")  String grantType,
+            @RequestParam("client_id")   String clientId,
             @RequestParam("client_secret") String clientSecret,
-            // scope is optional per RFC 6749; if absent, grant all allowed scopes
+            // scope is optional per RFC 6749; if absent, Keycloak grants
+            // the client's configured default scopes
             @RequestParam(value = "scope", required = false, defaultValue = "") String scopeParam
     ) {
-        // RFC 6749 §5.2: unsupported_grant_type → 400 Bad Request
-        // Only client_credentials is supported — no auth code, no refresh tokens
+        // ---- Validate grant type ----
+        // RFC 6749 §5.2: unsupported_grant_type → 400 Bad Request.
+        // This endpoint handles ONLY client_credentials.
+        // Authorization Code is handled by AuthorizationController (/auth/authorize, /auth/callback).
         if (!"client_credentials".equals(grantType)) {
-            log.warn("Unsupported grant_type '{}' requested by client '{}'", grantType, clientId);
+            log.warn("Unsupported grant_type='{}' from client_id='{}'", grantType, clientId);
             return ResponseEntity.badRequest().body(Map.of(
-                    "error", "unsupported_grant_type",
-                    "error_description", "Only client_credentials grant type is supported"
+                "error", "unsupported_grant_type",
+                "error_description",
+                    "Only client_credentials grant is supported on this endpoint. " +
+                    "For user login, use GET /auth/authorize (Authorization Code + PKCE)."
             ));
         }
 
-        // Look up the client in the in-memory registry.
-        // If client is null, the clientId is unknown. We still call constantTimeEquals()
-        // against an empty string to avoid timing differences between "unknown client"
-        // and "known client, wrong secret" — both should take the same time to respond.
-        ClientRecord client = CLIENT_REGISTRY.get(clientId);
-        if (client == null || !constantTimeEquals(client.secret(), clientSecret)) {
-            // RFC 6749 §5.2: invalid_client → 401 Unauthorized
-            // The WWW-Authenticate header is required by RFC 6749 when returning 401
-            log.warn("Authentication failed for client_id '{}'", clientId);
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                    .header("WWW-Authenticate", "Bearer realm=\"gaas\"")
-                    .body(Map.of(
-                            "error", "invalid_client",
-                            "error_description", "Client authentication failed"
-                    ));
-        }
-
-        // Determine the effective scopes for this token.
-        // If the client provided no scope parameter, grant all allowed scopes for this client.
-        // If scopes were requested, split them on whitespace (RFC 6749 scope format).
+        // ---- Parse requested scopes ----
+        // RFC 6749: scope is space-delimited. An empty scopeParam means "use client defaults".
+        // Keycloak will grant the intersection of requested scopes and the client's allowed scopes.
         List<String> requestedScopes = scopeParam.isBlank()
-                ? client.allowedScopes()
-                : Arrays.stream(scopeParam.split("\\s+"))
-                        .filter(s -> !s.isBlank())  // remove empty strings from multiple spaces
-                        .toList();
+            ? List.of()   // Empty list → Keycloak grants default scopes for this client
+            : Arrays.stream(scopeParam.split("\\s+"))
+                  .filter(s -> !s.isBlank())
+                  .toList();
 
-        // Scope elevation check: verify the client isn't requesting more than it's entitled to.
-        // Without this check, a client with api:read could request gateway:admin and receive it.
-        // The AI-generated draft omitted this check entirely — added manually during code review.
-        List<String> unauthorizedScopes = requestedScopes.stream()
-                .filter(s -> !client.allowedScopes().contains(s))
-                .toList();
+        try {
+            // ---- Delegate credential validation to Keycloak ----
+            // IdpTokenService calls POST <keycloak-token-endpoint> with:
+            //   grant_type=client_credentials, client_id=..., client_secret=..., scope=...
+            // If Keycloak rejects the credentials (wrong secret, unknown client, unauthorized
+            // scope), it returns 401 or 400, which IdpTokenService converts to SecurityException.
+            log.debug("Authenticating M2M client '{}' via IdP", clientId);
+            IdpTokenResponse idpResponse = idpTokenService.performClientCredentials(
+                clientId, clientSecret, requestedScopes);
 
-        if (!unauthorizedScopes.isEmpty()) {
-            log.warn("Client '{}' requested unauthorized scopes: {}", clientId, unauthorizedScopes);
+            // ---- Parse IdP token claims ----
+            // The IdP access token is trusted (received directly from Keycloak over mTLS).
+            // We parse it without signature verification to extract: sub, scope, exp.
+            Map<String, Object> idpClaims = idpTokenService.parseJwtClaims(
+                idpResponse.accessToken());
+
+            // ---- Extract the ACTUAL granted scopes from Keycloak's token ----
+            // Keycloak may grant fewer scopes than requested (if client config restricts them).
+            // We use the scopes in the Keycloak token — not the requested scopes — to ensure
+            // the GaaS JWT doesn't claim more than what Keycloak authorized.
+            String scopeFromIdp = (String) idpClaims.getOrDefault("scope", "");
+            List<String> grantedScopes = scopeFromIdp.isBlank()
+                ? requestedScopes  // fallback: use requested if Keycloak didn't include scope
+                : Arrays.stream(scopeFromIdp.split("\\s+"))
+                      .filter(s -> !s.isBlank())
+                      .toList();
+
+            // ---- MFA validation (M2M: always passes) ----
+            // For M2M clients, MFA (OTP/WebAuthn) is not applicable.
+            // IdpTokenService.validateMfaForHighPrivilegeScopes() recognizes isUserFlow=false
+            // and logs the high-privilege access for audit purposes without throwing.
+            // Defense-in-depth: Keycloak already controls which clients can request which scopes.
+            idpTokenService.validateMfaForHighPrivilegeScopes(idpClaims, grantedScopes, false);
+
+            // ---- Extract IdP subject ----
+            // For Client Credentials, the `sub` claim in Keycloak's token is typically
+            // the service account ID (UUID). We store this as `idp_sub` in the GaaS JWT
+            // for audit trail correlation (e.g., linking GaaS JWT to Keycloak audit logs).
+            String idpSubject = (String) idpClaims.getOrDefault("sub", clientId);
+
+            // ---- Issue GaaS JWT ----
+            // The GaaS JWT is signed with the Vault HMAC-SHA256 key (not Keycloak's RSA key).
+            // It carries:
+            //   sub:        clientId (human-readable machine client identity)
+            //   idp_sub:    Keycloak's stable subject ID (for audit logs)
+            //   scope:      the scopes Keycloak actually granted (not just requested)
+            //   grant_type: "client_credentials" (informational)
+            //   mfa:        false (M2M — MFA not applicable)
+            //   email:      null (M2M clients don't have email addresses)
+            String gaasToken = jwtService.issueFromIdpClaims(
+                clientId,
+                grantedScopes,
+                "client_credentials",
+                idpSubject,
+                false,   /* mfaCompleted: false for M2M */
+                null     /* email: null for machine clients */
+            );
+
+            log.info("GaaS JWT issued for M2M client '{}' (idp_sub='{}') scopes={}",
+                clientId, idpSubject, grantedScopes);
+
+            // ---- RFC 6749 §5.1 success response ----
+            return ResponseEntity.ok(Map.of(
+                "access_token", gaasToken,
+                "token_type",   "Bearer",
+                "expires_in",   3600,
+                "scope",        String.join(" ", grantedScopes)
+            ));
+
+        } catch (SecurityException e) {
+            // Keycloak rejected the client credentials (wrong secret, unknown client,
+            // unauthorized scope, or Keycloak is misconfigured for this client).
+            // RFC 6749 §5.2: invalid_client → 401 Unauthorized.
+            // WWW-Authenticate header is required by RFC 6749 when returning 401.
+            log.warn("IdP rejected M2M credentials for client_id='{}': {}", clientId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .header("WWW-Authenticate", "Bearer realm=\"gaas\"")
+                .body(Map.of(
+                    "error", "invalid_client",
+                    "error_description",
+                        "Client authentication failed at identity provider. " +
+                        "Check client_id, client_secret, and scope configuration in Keycloak."
+                ));
+
+        } catch (MfaValidationException e) {
+            // This path should not be reached for M2M (MFA check always passes for machines).
+            // Included as a defensive catch in case IdpTokenService behavior changes.
+            log.error("Unexpected MFA validation failure for M2M client '{}': {}",
+                clientId, e.getMessage());
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
-                    "error", "insufficient_scope",
-                    "error_description", "Requested scopes exceed client permissions: " + unauthorizedScopes
+                "error", "mfa_required",
+                "error_description", "Unexpected MFA requirement for M2M client: " + e.getMessage()
+            ));
+
+        } catch (Exception e) {
+            // Catch-all for unexpected failures (Keycloak unreachable, JSON parse errors, etc.)
+            // Log at ERROR level because this is unexpected — not a normal auth failure.
+            log.error("Unexpected error during M2M token issuance for client '{}': {}",
+                clientId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of(
+                "error", "idp_unavailable",
+                "error_description",
+                    "The identity provider is temporarily unavailable. Please retry in a moment."
             ));
         }
-
-        // All checks passed — ask JwtService to build and sign the JWT.
-        // JwtService handles all cryptographic operations and Vault key management.
-        String token = jwtService.issueToken(clientId, requestedScopes);
-        log.info("Issued token for client '{}' with scopes: {}", clientId, requestedScopes);
-
-        // RFC 6749 §5.1 success response format
-        return ResponseEntity.ok(Map.of(
-                "access_token", token,          // the signed JWT compact string
-                "token_type", "Bearer",          // always Bearer for JWTs
-                "expires_in", 3600,             // seconds until expiry (matches gaas.jwt.expiry-seconds)
-                "scope", String.join(" ", requestedScopes)  // space-delimited granted scopes
-        ));
     }
-
-    /**
-     * Constant-time byte comparison to prevent timing-based client secret enumeration.
-     *
-     * WHY THIS MATTERS:
-     *   Standard string comparison (String.equals, ==) returns early on the first
-     *   mismatched byte, leaking how many bytes of the guess are correct via response time.
-     *   An attacker measuring 10,000 requests can determine the secret character by character.
-     *
-     * WHY MessageDigest.isEqual():
-     *   The JDK's MessageDigest.isEqual() is documented to run in O(n) time where n is
-     *   the length of the shorter array, regardless of where the bytes differ. It does NOT
-     *   short-circuit on length mismatch or on a mismatched byte — both cases take the same
-     *   wall-clock time, giving the attacker no useful signal.
-     *
-     * @param a The expected secret (from the client registry)
-     * @param b The provided secret (from the incoming HTTP request)
-     * @return  true if and only if a and b are byte-for-byte identical
-     */
-    private boolean constantTimeEquals(String a, String b) {
-        // Convert to bytes first — String encoding is platform-dependent,
-        // but getBytes() uses the JVM's default charset consistently here.
-        return MessageDigest.isEqual(a.getBytes(), b.getBytes());
-    }
-
-    /**
-     * Immutable record holding a client's registered credentials and allowed scopes.
-     *
-     * Java records are:
-     *   - Immutable by default (all fields are final)
-     *   - Auto-generated with constructor, getters, equals(), hashCode(), toString()
-     *   - Ideal for simple data carriers like this client registration entry
-     *
-     * In production, this would be a JPA Entity or a Vault KV response object.
-     */
-    private record ClientRecord(String secret, List<String> allowedScopes) {}
 }

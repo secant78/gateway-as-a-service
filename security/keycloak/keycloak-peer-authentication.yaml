@@ -1,0 +1,60 @@
+# ============================================================
+# Istio PeerAuthentication — gaas-idp Namespace
+# ============================================================
+#
+# PURPOSE:
+#   Enforces STRICT mTLS for ALL traffic within the gaas-idp namespace.
+#   This means every connection TO Keycloak from any other service (including
+#   the auth-service in the gaas namespace) MUST use mutual TLS.
+#
+# WHY THIS MATTERS FOR KEYCLOAK:
+#   Keycloak handles authentication for the entire GaaS platform. If an attacker
+#   can make unauthenticated TCP connections to Keycloak (bypassing the Istio sidecar),
+#   they could potentially exploit Keycloak vulnerabilities without a valid SPIFFE identity.
+#   STRICT mTLS closes this attack vector — only Istio-identified services can connect.
+#
+# HOW STRICT mTLS WORKS FOR KEYCLOAK:
+#   1. Auth Service (gaas namespace) calls Keycloak (gaas-idp namespace)
+#   2. Auth Service's Envoy sidecar presents its SPIFFE certificate:
+#      spiffe://cluster.local/ns/gaas/sa/default
+#   3. Keycloak's Envoy sidecar validates the certificate and accepts the connection
+#   4. Traffic between sidecars is TLS 1.3 encrypted
+#   5. Keycloak itself receives plain HTTP (from its own sidecar) — no TLS config needed
+#
+# This complements the STRICT PeerAuthentication in infrastructure/peer-authentication.yaml
+# which covers the gaas and gaas-vault namespaces.
+#
+# HOW TO VERIFY:
+#   kubectl exec -n gaas <auth-service-pod> -c istio-proxy -- \
+#     openssl s_client -connect keycloak-svc.gaas-idp.svc.cluster.local:8080
+#   → Should show a TLS handshake with a SPIFFE cert
+#
+# HOW TO APPLY:
+#   (Applied automatically by the CI pipeline after namespace creation)
+#   kubectl apply -f keycloak-peer-authentication.yaml
+# ============================================================
+
+---
+# PeerAuthentication for the gaas-idp namespace
+# selector: {} (empty) means "applies to ALL pods in this namespace"
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: gaas-idp-strict-mtls
+  namespace: gaas-idp
+  labels:
+    app.kubernetes.io/part-of: gaas
+    app.kubernetes.io/component: security
+spec:
+  # No selector: this PeerAuthentication applies to EVERY pod in gaas-idp.
+  # A non-empty selector would scope it to specific pods by label.
+  # We want ALL traffic to/from Keycloak to require mTLS, so we use namespace-wide policy.
+  mtls:
+    # STRICT: Reject all non-mTLS connections. This is the Zero Trust boundary.
+    # If a pod without an Istio sidecar tries to connect to Keycloak, the connection
+    # is immediately terminated with a TLS alert — the request never reaches Keycloak.
+    #
+    # Contrast with:
+    #   PERMISSIVE: Accept both mTLS and plaintext (useful during migration)
+    #   DISABLE: Only accept plaintext (never use this in production)
+    mode: STRICT

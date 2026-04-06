@@ -78,6 +78,9 @@
         <java.version>21</java.version>             <!-- requires JDK 21 -->
         <jjwt.version>0.12.5</jjwt.version>         <!-- JJWT library for JWT creation -->
         <spring-vault.version>3.1.1</spring-vault.version>  <!-- Spring Vault for Vault integration -->
+        <!-- Spring Security OAuth2 JOSE (JSON Object Signing and Encryption) library version.
+             Managed by the Spring Boot parent POM — no explicit version needed here.
+             Provides: NimbusJwtDecoder, JWKS fetching, JWT parsing, JWK Set caching. -->
     </properties>
 
     <dependencies>
@@ -160,6 +163,67 @@
           Without this dependency, Kubernetes probes would get 404 responses
           and the pod would be marked as unhealthy and restarted.
         -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!--
+          spring-boot-starter-oauth2-client
+          Provides Spring's OAuth 2.0 client infrastructure:
+            - ClientRegistration and ClientRegistrationRepository (IdP client configs)
+            - OAuth2AuthorizedClientManager (manages token lifecycle for outgoing calls)
+            - PKCE support for Authorization Code flows
+            - RestTemplate / WebClient integration for OAuth-protected API calls
+
+          In GaaS, this dependency enables:
+            1. The @ConfigurationProperties binding for gaas.idp.* properties
+            2. OAuth2 client registration for Keycloak in the Spring Security context
+            3. PKCE parameter generation helpers (used in AuthorizationController)
+
+          spring-security-oauth2-jose (included transitively):
+            Provides JWT/JWS/JWE parsing via the Nimbus JOSE+JWT library.
+            NimbusJwtDecoder can fetch Keycloak's JWKS and validate JWT signatures.
+            This replaces manual base64 decoding when full signature validation is needed.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-client</artifactId>
+        </dependency>
+
+        <!--
+          spring-boot-starter-oauth2-resource-server
+          Configures the auth service as an OAuth 2.0 Resource Server.
+          This enables:
+            - Automatic JWT Bearer token validation on incoming requests
+            - Spring Security integration with Keycloak's JWKS endpoint
+            - JWT claim extraction for the Spring Security principal
+
+          In GaaS, this is used for:
+            - Protecting admin endpoints with Keycloak-issued token validation
+            - The JWT decoder auto-configuration (reads gaas.idp.jwks-uri)
+
+          NOTE: The default auto-configuration validates ALL incoming Bearer tokens
+          against the JWKS. SecurityConfig.java overrides this to permit the
+          /oauth2/token and /auth/* endpoints (which bootstrap authentication).
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+
+        <!--
+          spring-boot-configuration-processor (optional, compile-time only)
+          Generates META-INF/spring-configuration-metadata.json from @ConfigurationProperties classes.
+          This JSON file enables IDE autocomplete for gaas.idp.* properties in application.properties.
+          scope=optional: not included in the runtime fat JAR — only needed during compilation.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

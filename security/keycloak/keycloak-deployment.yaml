@@ -1,0 +1,319 @@
+# ============================================================
+# Keycloak 24 — Identity Provider Deployment
+# ============================================================
+#
+# PURPOSE:
+#   Deploys Keycloak as the central Identity Provider (IdP) for GaaS.
+#   Keycloak handles:
+#     - M2M (Machine-to-Machine): Client Credentials Grant — validates client_id/secret
+#     - U2M (User-to-Machine):    Authorization Code + PKCE — validates human users
+#     - MFA enforcement:          OTP/TOTP required for high-privilege scopes
+#
+#   The GaaS Auth Service (auth-service) delegates ALL credential validation
+#   to Keycloak. It then re-issues a GaaS-specific JWT (signed with the Vault key)
+#   that is accepted by APISIX's jwt-auth plugin.
+#
+# ARCHITECTURE POSITION:
+#
+#   [M2M Client] ──POST /oauth2/token──► [Auth Service]
+#                                              │
+#                                              ▼  (Client Credentials)
+#                                        [Keycloak] ──► validates credentials
+#                                              │         ──► issues IdP token
+#                                              │
+#                                        [Auth Service] ──► checks AMR for MFA
+#                                              │         ──► re-issues GaaS JWT
+#                                              ▼
+#                                       [APISIX jwt-auth] ──► accepts GaaS JWT
+#
+#   [User Browser] ──GET /auth/authorize──► [Auth Service]
+#                                               │
+#                                               ▼  (302 Redirect)
+#                                         [Keycloak Login + MFA]
+#                                               │
+#                                               ▼  (callback with code)
+#                                         [Auth Service /auth/callback]
+#                                               │  exchanges code, validates AMR
+#                                               │  re-issues GaaS JWT
+#                                               ▼
+#                                          [Client App receives GaaS JWT]
+#
+# NAMESPACE:
+#   gaas-idp — isolated from gaas namespace for blast-radius containment.
+#   Istio mTLS covers all traffic (see keycloak-peer-authentication.yaml).
+#
+# DNS (within cluster):
+#   keycloak-svc.gaas-idp.svc.cluster.local:8080
+#
+# PRODUCTION UPGRADE PATH:
+#   1. Replace H2 (dev mode) with PostgreSQL: add KC_DB=postgres, KC_DB_URL env vars
+#   2. Switch from start-dev to start
+#   3. Enable TLS: add KC_HTTPS_CERTIFICATE_FILE, KC_HTTPS_CERTIFICATE_KEY_FILE
+#   4. Add horizontal scaling: replicas > 1, add KC_CACHE=infinispan for session sync
+#   5. Provision admin credentials from Vault instead of K8s Secret
+#
+# HOW TO APPLY:
+#   kubectl apply -f keycloak-deployment.yaml
+#   kubectl rollout status deployment/keycloak -n gaas-idp
+#
+# HOW TO ACCESS (local port-forward for setup):
+#   kubectl port-forward svc/keycloak-svc 8080:8080 -n gaas-idp
+#   Then: http://localhost:8080/admin (admin UI for development)
+# ============================================================
+
+---
+# ============================================================
+# ServiceAccount: keycloak-sa
+# ============================================================
+# A dedicated ServiceAccount gives Keycloak an explicit Kubernetes identity.
+# Istio's SPIFFE ID for this pod will be:
+#   spiffe://cluster.local/ns/gaas-idp/sa/keycloak-sa
+# This identity can be used in AuthorizationPolicy rules to control which
+# other services in the mesh can send traffic to Keycloak.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keycloak-sa
+  namespace: gaas-idp
+  labels:
+    app: keycloak
+    app.kubernetes.io/part-of: gaas
+    app.kubernetes.io/component: identity-provider
+
+---
+# ============================================================
+# Secret: keycloak-admin-credentials
+# ============================================================
+# Holds the Keycloak admin username and password for the initial bootstrap.
+# The Keycloak deployment reads these at startup to create the admin user.
+#
+# SECURITY NOTE:
+#   In production, provision this Secret from Vault using:
+#   - Vault Agent Injector: injects the secret as an env var at pod startup
+#   - External Secrets Operator: syncs Vault secrets into K8s Secrets
+#   NEVER commit real passwords here — this is a placeholder for development.
+#
+# stringData: values are stored as UTF-8 strings (Kubernetes encodes to base64 internally)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-admin-credentials
+  namespace: gaas-idp
+  labels:
+    app: keycloak
+    app.kubernetes.io/part-of: gaas
+type: Opaque
+stringData:
+  # The initial admin username for the Keycloak master realm
+  KEYCLOAK_ADMIN: "admin"
+  # CHANGE THIS before any real deployment. Min 16 chars recommended.
+  KEYCLOAK_ADMIN_PASSWORD: "admin-password-change-me"
+
+---
+# ============================================================
+# Deployment: keycloak
+# ============================================================
+# Runs Keycloak 24.0.3 (Quarkus-based, replaces the legacy WildFly-based image).
+#
+# Key Keycloak 24 changes vs older versions:
+#   - Command is now `start-dev` (dev) or `start` (production) — not `standalone.sh`
+#   - Health endpoints moved to /health/ready and /health/live
+#   - Configuration uses KC_* environment variables instead of standalone.xml
+#   - Quarkus startup is faster (~10s vs 60s for WildFly)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: gaas-idp
+  labels:
+    app: keycloak
+    app.kubernetes.io/part-of: gaas
+    app.kubernetes.io/component: identity-provider
+    app.kubernetes.io/version: "24.0.3"
+spec:
+  # Single replica is fine for dev/staging. For production HA:
+  # Set replicas: 3 and ensure KC_CACHE=infinispan is configured for session replication.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+        app.kubernetes.io/part-of: gaas
+      annotations:
+        # Enable Istio sidecar injection. The Envoy proxy handles mTLS transparently —
+        # Keycloak itself doesn't need TLS configuration (Istio terminates it).
+        sidecar.istio.io/inject: "true"
+    spec:
+      serviceAccountName: keycloak-sa
+
+      # Security context applied to all containers in the pod.
+      # runAsNonRoot: pod fails if the container image runs as root (UID 0).
+      # The Keycloak 24 image uses UID 1000 (jboss user) — compliant.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: keycloak
+          # Keycloak 24.0.3 (Quarkus distribution). Pin to a specific version
+          # (not :latest) so deployments are reproducible.
+          image: quay.io/keycloak/keycloak:24.0.3
+          imagePullPolicy: IfNotPresent
+
+          # start-dev: Development mode with:
+          #   - H2 in-memory database (resets on restart — use PostgreSQL for production)
+          #   - HTTP enabled (no TLS cert required — TLS handled by Istio)
+          #   - Relaxed hostname checks
+          #   - Hot-reload of theme changes
+          # For production: change to ["start"] and add KC_DB env vars
+          command: ["start-dev"]
+
+          env:
+            # ---- Admin credentials (read from Secret above) ----
+            - name: KEYCLOAK_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin-credentials
+                  key: KEYCLOAK_ADMIN
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin-credentials
+                  key: KEYCLOAK_ADMIN_PASSWORD
+
+            # ---- HTTP configuration ----
+            - name: KC_HTTP_PORT
+              value: "8080"
+            # KC_HOSTNAME_STRICT=false: Keycloak accepts requests regardless of the
+            # Host header value. Required when behind Istio/ALB which may change the Host.
+            # In production: set KC_HOSTNAME to the public FQDN (e.g., auth.gaas.internal)
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+            - name: KC_HTTP_ENABLED
+              value: "true"
+
+            # KC_PROXY=edge: Trust X-Forwarded-For and X-Forwarded-Proto headers from
+            # the upstream proxy (Istio Envoy / ALB). This ensures:
+            #   - Keycloak generates correct redirect URIs with https:// scheme
+            #   - Client IP is correctly reported in audit logs
+            - name: KC_PROXY
+              value: "edge"
+
+            # ---- Logging ----
+            - name: KC_LOG_LEVEL
+              value: "INFO"
+            # Set to DEBUG to trace OIDC flows, token issuance, and MFA events:
+            # - name: KC_LOG_LEVEL
+            #   value: "DEBUG"
+
+            # ---- JVM tuning ----
+            # Restricts heap size to fit within the 1Gi memory limit.
+            # -XX:+UseContainerSupport tells the JVM to respect cgroup limits
+            # (important inside Kubernetes where total RAM ≠ container limit).
+            - name: JAVA_OPTS_APPEND
+              value: "-XX:+UseContainerSupport -XX:MaxRAMPercentage=70.0"
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            # Management port for Keycloak health endpoints (separate from main HTTP port)
+            - name: management
+              containerPort: 9000
+              protocol: TCP
+
+          # ---- Resource limits ----
+          # Keycloak (Quarkus) is memory-efficient but needs at least 512Mi.
+          # Requests are what Kubernetes uses for scheduling; limits prevent OOM kills.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m   # Allow burst up to 1 vCPU during heavy authentication load
+              memory: 1Gi  # Includes JVM heap + off-heap (Infinispan cache, etc.)
+
+          # ---- Readiness probe ----
+          # Keycloak must pass readiness before the Service routes traffic to it.
+          # /health/ready: returns 200 only when Keycloak is fully initialized and
+          # ready to accept login requests (DB connections up, themes loaded, etc.).
+          # initialDelaySeconds: 60s because Keycloak's Quarkus startup takes ~20-30s,
+          # plus time for the Istio sidecar to initialize.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: management   # Uses the management port (9000), not main HTTP (8080)
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 6   # Allow 60s window for slow starts
+            successThreshold: 1
+
+          # ---- Liveness probe ----
+          # If Keycloak becomes unresponsive (deadlock, OOM, etc.), the liveness probe
+          # fails and Kubernetes restarts the pod.
+          # initialDelaySeconds: 90s — give even more time before starting liveness checks.
+          # Restarting a live pod unnecessarily is worse than waiting.
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: management
+            initialDelaySeconds: 90
+            periodSeconds: 15
+            failureThreshold: 4
+
+          # ---- Container security context ----
+          # Principle of least privilege: drop all Linux capabilities,
+          # prevent privilege escalation, and use the default seccomp profile.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]  # Keycloak 24 runs fine without any Linux capabilities
+            seccompProfile:
+              type: RuntimeDefault  # Restricts system calls to those needed by most apps
+
+---
+# ============================================================
+# Service: keycloak-svc
+# ============================================================
+# Internal ClusterIP Service — accessible ONLY from within the Kubernetes cluster.
+# Auth Service calls Keycloak using this DNS name:
+#   http://keycloak-svc.gaas-idp.svc.cluster.local:8080
+#
+# The Istio sidecar transparently upgrades this HTTP connection to mTLS
+# (per keycloak-peer-authentication.yaml), so the actual wire traffic is TLS.
+#
+# EXTERNAL ACCESS (for development/admin UI only):
+#   kubectl port-forward svc/keycloak-svc 8080:8080 -n gaas-idp
+#   Then open: http://localhost:8080/admin
+#
+# For production public access, add an Istio Gateway + VirtualService or
+# expose via the ALB with a dedicated path prefix.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-svc
+  namespace: gaas-idp
+  labels:
+    app: keycloak
+    app.kubernetes.io/part-of: gaas
+    app.kubernetes.io/component: identity-provider
+spec:
+  # ClusterIP: accessible only from within the cluster.
+  # This is the most secure service type — no external exposure.
+  type: ClusterIP
+  selector:
+    # Routes to pods with label: app=keycloak (matches the Deployment template)
+    app: keycloak
+  ports:
+    - name: http
+      port: 8080       # Port that other services call (the Service's virtual port)
+      targetPort: 8080 # Port the Keycloak container listens on (KC_HTTP_PORT)
+      protocol: TCP
+    - name: management
+      port: 9000       # Keycloak management port (health, metrics, info)
+      targetPort: management
+      protocol: TCP

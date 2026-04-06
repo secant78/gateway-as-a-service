@@ -1,0 +1,863 @@
+# ============================================================
+# GaaS CI/CD Pipeline — GitHub Actions
+# ============================================================
+#
+# PURPOSE:
+#   End-to-end CI/CD pipeline for the Gateway-as-a-Service (GaaS) project.
+#   Runs on every push to main or feature/** branches that touch gaas/ files.
+#
+# PIPELINE ARCHITECTURE (7 jobs):
+#
+#   security-scan ─────────────────────────────────────────────────────────┐
+#        │                                                                  │
+#        ├──► build-auth-service (parallel)                                 │
+#        │        Compiles Java, runs tests, pushes Docker image            │
+#        │                                                                  │
+#        └──► lint-and-validate (parallel)                                  │
+#                 Flake8, YAML lint, Helm lint                             │
+#                      │                                                    │
+#                      ▼ (all three must pass)                             │
+#               terraform-plan                                             │
+#                 Previews AWS infra changes                               │
+#                      │                                                    │
+#                      ▼                                                    │
+#               deploy-staging                                             │
+#                 Keycloak + Vault + APISIX + auth-service                 │
+#                 Configures Keycloak realm and clients                    │
+#                 Smoke tests all auth flows                               │
+#                      │                                                    │
+#                      ▼                                                    │
+#               canary-deploy                                              │
+#                 Istio traffic shift: 10% → 50% → 100%                   │
+#                 Validates error rate at each weight                      │
+#                      │                                                    │
+#                      ▼ (main branch only)                                │
+#               terraform-apply ◄──────────────────────────────────────────┘
+#                 Applies AWS ALB changes
+#
+# AUTHENTICATION:
+#   - AWS: OIDC federated identity (no long-lived access keys in GitHub Secrets)
+#   - GHCR: GITHUB_TOKEN (auto-provided by GitHub Actions)
+#   - Vault: dev root token (injected as VAULT_TOKEN secret)
+#
+# KEY INTEGRATIONS (new vs. original):
+#   - Keycloak is deployed in the deploy-staging job
+#   - keycloak-setup.sh configures realm, clients, roles, and MFA flow
+#   - Smoke tests cover M2M (Client Credentials) AND U2M (Authorization Code)
+#   - Canary deploy now includes auth-service-stable (canary traffic splitting)
+# ============================================================
+
+name: GaaS Platform CI/CD
+
+on:
+  push:
+    branches: [main, "feature/**"]
+    # Only trigger when GaaS-related files change — avoids running on unrelated commits
+    paths:
+      - "gaas/**"
+      - ".github/workflows/05-gaas-pipeline.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "gaas/**"
+  # Allow manual triggers with custom inputs (useful for testing specific scenarios)
+  workflow_dispatch:
+    inputs:
+      skip_terraform_apply:
+        description: "Skip the terraform apply job (true/false)"
+        required: false
+        default: "false"
+      canary_initial_weight:
+        description: "Initial canary traffic weight % (default: 10)"
+        required: false
+        default: "10"
+      environment:
+        description: "Target environment (staging/production)"
+        required: false
+        default: "staging"
+
+# Global environment variables available to all jobs
+env:
+  # Kubernetes namespace where all GaaS workloads are deployed
+  GAAS_NAMESPACE: gaas
+  # Namespace where Keycloak (IdP) is deployed
+  IDP_NAMESPACE: gaas-idp
+  # Namespace where Vault is deployed
+  VAULT_NAMESPACE: gaas-vault
+  # Docker registry for the auth service image
+  REGISTRY: ghcr.io
+  # The Docker image name (organization/repo-name/image-name)
+  IMAGE_NAME: ${{ github.repository }}/auth-service
+  # Canary traffic weights — customize via workflow_dispatch inputs
+  CANARY_INITIAL_WEIGHT: ${{ github.event.inputs.canary_initial_weight || '10' }}
+  CANARY_MID_WEIGHT: "50"
+  CANARY_FINAL_WEIGHT: "100"
+
+# ============================================================
+# Job 1: Security Scan (gates ALL downstream jobs)
+# ============================================================
+jobs:
+  security-scan:
+    name: Security Scan (Trivy)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # Required to upload SARIF scan results to GitHub Security tab
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Trivy scans Terraform files for IaC misconfigurations:
+      # - Open security groups (0.0.0.0/0 on sensitive ports)
+      # - Missing encryption, missing logging, public S3 buckets, etc.
+      - name: Trivy IaC scan (Terraform)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: gaas/terraform/
+          format: sarif
+          output: trivy-iac.sarif
+          exit-code: "1"  # Fail the job if HIGH or CRITICAL findings exist
+          severity: HIGH,CRITICAL
+
+      - name: Upload IaC scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()  # Upload results even if Trivy exits non-zero (to see findings)
+        with:
+          sarif_file: trivy-iac.sarif
+
+      # Trivy scans pom.xml for CVEs in Java dependencies.
+      # This catches known vulnerabilities in Spring Boot, JJWT, Vault client, etc.
+      - name: Trivy dependency scan (Maven pom.xml)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: gaas/security/auth-service/
+          format: sarif
+          output: trivy-deps.sarif
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+
+      - name: Upload dependency scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-deps.sarif
+
+  # ============================================================
+  # Job 2: Build and Push Auth Service Docker Image
+  # ============================================================
+  build-auth-service:
+    name: Build Auth Service
+    runs-on: ubuntu-latest
+    needs: security-scan  # Only build if security scan passes
+    permissions:
+      contents: read
+      packages: write   # Required to push to GitHub Container Registry (GHCR)
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Log in to GHCR using the auto-provided GITHUB_TOKEN.
+      # No secret setup required — GitHub Actions provides this token automatically.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Extract metadata for Docker tags and labels.
+      # Automatically generates tags like: sha-<commit>, latest, v1.0.0 (if tagged)
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      # Docker Buildx enables multi-platform builds and improved layer caching.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push auth-service image
+        uses: docker/build-push-action@v5
+        with:
+          context: gaas/security/auth-service/
+          file: gaas/security/auth-service/Dockerfile
+          push: true  # Always push (even on PRs, for staging deploy to use)
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache: fetches previous build layers from GHCR.
+          # First build: slow (downloads all layers). Subsequent: fast (cached).
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  # ============================================================
+  # Job 3: Lint and Validate (parallel with build)
+  # ============================================================
+  lint-and-validate:
+    name: Lint and Validate
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Flake8 is a Python style checker. Checks rbac_audit.py for:
+      # - PEP 8 violations (formatting, naming)
+      # - Syntax errors
+      # - Undefined variables
+      - name: Lint Python (Flake8)
+        run: |
+          pip install flake8
+          flake8 gaas/ops/rbac_audit.py --max-line-length=120 --statistics
+
+      # yamllint checks all YAML files for syntax errors and style issues.
+      # Catches malformed Kubernetes manifests before kubectl apply fails.
+      - name: Lint YAML files
+        run: |
+          pip install yamllint
+          yamllint -d relaxed gaas/infrastructure/
+          yamllint -d relaxed gaas/security/keycloak/
+          yamllint -d relaxed gaas/security/vault/
+          yamllint -d relaxed gaas/gateway/*.yaml
+
+      # Helm lint validates the tenant-app chart template syntax.
+      # Catches Helm function errors (like the mulf → mul bug we fixed earlier).
+      - name: Helm lint (tenant-app chart)
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm lint gaas/gateway/charts/tenant-app/ \
+            --set tenantId=test-tenant \
+            --set apisixRoute.pathPrefix=/tenants/test \
+            --debug
+
+      # Validate Keycloak setup script has no syntax errors (bash -n is a dry-run check)
+      - name: Validate Keycloak setup script syntax
+        run: bash -n gaas/security/keycloak/keycloak-setup.sh
+
+  # ============================================================
+  # Job 4: Terraform Plan (preview infrastructure changes)
+  # ============================================================
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [build-auth-service, lint-and-validate]
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC AWS authentication
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Authenticate to AWS using OIDC (no long-lived access keys).
+      # The GitHub OIDC provider must be configured in the AWS account.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        working-directory: gaas/terraform/
+        run: terraform init
+
+      # Plan with placeholder values — in production, use real VPC/subnet IDs.
+      # The plan output shows what resources would be created/modified/destroyed.
+      - name: Terraform Plan
+        working-directory: gaas/terraform/
+        run: |
+          terraform plan \
+            -var="minikube_node_ip=10.0.1.5" \
+            -var="vpc_id=vpc-placeholder" \
+            -var="public_subnet_ids=[\"subnet-placeholder1\",\"subnet-placeholder2\"]" \
+            -var="acm_cert_arn=arn:aws:acm:us-east-1:123456789:certificate/placeholder" \
+            -var="environment=staging" \
+            -out=tfplan \
+            -no-color 2>&1 | tee terraform-plan.txt
+
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: |
+            gaas/terraform/tfplan
+            gaas/terraform/terraform-plan.txt
+
+  # ============================================================
+  # Job 5: Deploy to Staging
+  # ============================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    environment: staging  # Requires staging environment approval if configured
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Set up the local Minikube cluster that simulates staging.
+      # Minikube starts a local single-node Kubernetes cluster.
+      - name: Start Minikube
+        uses: medyagh/setup-minikube@master
+        with:
+          minikube-version: "1.32.0"
+          kubernetes-version: "v1.28.0"
+          cpus: 4
+          memory: 8192mb
+
+      # Install Istio for mTLS between all services.
+      # demo profile: includes all Istio components (control plane + data plane).
+      - name: Install Istio
+        run: |
+          curl -L https://istio.io/downloadIstio | ISTIO_VERSION=1.20.0 sh -
+          ./istio-1.20.0/bin/istioctl install --set profile=demo -y
+          kubectl wait --for=condition=available deployment/istiod -n istio-system --timeout=120s
+
+      # Create all namespaces with istio-injection BEFORE deploying any pods.
+      # The injection webhook fires at pod creation time — not retroactively.
+      - name: Create namespaces (gaas, gaas-vault, gaas-idp)
+        run: |
+          kubectl apply -f gaas/infrastructure/namespace.yaml
+          kubectl apply -f gaas/infrastructure/peer-authentication.yaml
+          kubectl apply -f gaas/security/keycloak/keycloak-peer-authentication.yaml
+          # Verify Istio injection is enabled on all namespaces
+          kubectl get namespace gaas gaas-vault gaas-idp \
+            -o jsonpath='{.items[*].metadata.labels.istio-injection}'
+
+      # ---- Deploy HashiCorp Vault ----
+      - name: Deploy Vault
+        run: |
+          kubectl apply -f gaas/security/vault/vault-deployment.yaml
+          kubectl rollout status deployment/vault -n ${{ env.VAULT_NAMESPACE }} --timeout=90s
+
+      # Bootstrap Vault: enable KV v2, write policy, and write the JWT signing key.
+      # The signing key is a base64-encoded 256-bit HMAC key.
+      - name: Bootstrap Vault
+        env:
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          # Port-forward Vault for setup commands (background)
+          kubectl port-forward svc/vault -n ${{ env.VAULT_NAMESPACE }} 8200:8200 &
+          PF_PID=$!
+          sleep 5  # Wait for port-forward to be ready
+
+          # Enable KV v2 secrets engine
+          VAULT_ADDR=http://127.0.0.1:8200 vault secrets enable -path=secret kv-v2 || true
+
+          # Apply the gaas-auth policy
+          VAULT_ADDR=http://127.0.0.1:8200 vault policy write gaas-auth \
+            gaas/security/vault/vault-policy.hcl
+
+          # Generate and store a 256-bit JWT signing key in Vault
+          SIGNING_KEY=$(openssl rand -base64 32)
+          VAULT_ADDR=http://127.0.0.1:8200 vault kv put \
+            secret/gaas/jwt-signing-key value="${SIGNING_KEY}"
+
+          echo "✓ Vault bootstrapped with JWT signing key"
+          kill $PF_PID
+
+      # ---- Deploy Keycloak (Identity Provider) ----
+      - name: Deploy Keycloak
+        run: |
+          kubectl apply -f gaas/security/keycloak/keycloak-deployment.yaml
+          # Wait up to 5 minutes — Keycloak takes ~60s to start on first run
+          kubectl rollout status deployment/keycloak -n ${{ env.IDP_NAMESPACE }} --timeout=300s
+          echo "✓ Keycloak pod is running and ready"
+
+      # Configure Keycloak realm, clients, roles, and MFA authentication flow.
+      # This runs the keycloak-setup.sh script via port-forward.
+      - name: Configure Keycloak realm and clients
+        env:
+          KEYCLOAK_GATEWAY_SECRET: ${{ secrets.KEYCLOAK_GATEWAY_SECRET }}
+          KEYCLOAK_TENANT_APP_SECRET: ${{ secrets.KEYCLOAK_TENANT_APP_SECRET }}
+          KEYCLOAK_CI_PIPELINE_SECRET: ${{ secrets.KEYCLOAK_CI_PIPELINE_SECRET }}
+          KEYCLOAK_AUTH_SERVICE_SECRET: ${{ secrets.KEYCLOAK_AUTH_SERVICE_SECRET }}
+        run: |
+          # Port-forward Keycloak for the setup script
+          kubectl port-forward svc/keycloak-svc 8080:8080 -n ${{ env.IDP_NAMESPACE }} &
+          KC_PF_PID=$!
+          sleep 10  # Wait for port-forward to be ready and Keycloak to accept connections
+
+          # Run the Keycloak setup script
+          KEYCLOAK_URL=http://localhost:8080 \
+          AUTH_SERVICE_CALLBACK=http://auth-service.${{ env.GAAS_NAMESPACE }}.svc.cluster.local:8081/auth/callback \
+          bash gaas/security/keycloak/keycloak-setup.sh
+
+          kill $KC_PF_PID
+          echo "✓ Keycloak realm 'gaas' configured with clients and MFA flow"
+
+      # ---- Deploy APISIX ----
+      - name: Install APISIX via Helm
+        run: |
+          helm repo add apisix https://charts.apiseven.com
+          helm repo update
+          helm upgrade --install apisix apisix/apisix \
+            --namespace ${{ env.GAAS_NAMESPACE }} \
+            --values gaas/gateway/apisix-values.yaml \
+            --wait \
+            --timeout 5m
+
+      # Apply APISIX configuration (Consumer for jwt-auth, OIDC routes for user tokens)
+      - name: Apply APISIX routes and consumers
+        run: |
+          kubectl apply -f gaas/gateway/apisix-consumer.yaml
+          kubectl apply -f gaas/gateway/apisix-oidc-routes.yaml
+          echo "✓ APISIX Consumer and OIDC routes applied"
+
+      # ---- Deploy Auth Service ----
+      - name: Deploy Auth Service
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          # Create the auth-service Kubernetes Deployment
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: auth-service-stable
+            namespace: ${{ env.GAAS_NAMESPACE }}
+            labels:
+              app: auth-service
+              version: stable
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: auth-service
+                version: stable
+            template:
+              metadata:
+                labels:
+                  app: auth-service
+                  version: stable
+                annotations:
+                  sidecar.istio.io/inject: "true"
+              spec:
+                containers:
+                  - name: auth-service
+                    image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+                    ports:
+                      - containerPort: 8081
+                    env:
+                      - name: VAULT_TOKEN
+                        value: "${{ secrets.VAULT_TOKEN }}"
+                      - name: SPRING_CLOUD_VAULT_URI
+                        value: "http://vault.${{ env.VAULT_NAMESPACE }}.svc.cluster.local:8200"
+                      - name: GAAS_IDP_ISSUER_URI
+                        value: "http://keycloak-svc.${{ env.IDP_NAMESPACE }}.svc.cluster.local:8080/realms/gaas"
+                      - name: GAAS_IDP_CLIENT_ID
+                        value: "auth-service"
+                      - name: GAAS_IDP_CLIENT_SECRET
+                        value: "${{ secrets.KEYCLOAK_AUTH_SERVICE_SECRET }}"
+                      - name: GAAS_IDP_TOKEN_ENDPOINT
+                        value: "http://keycloak-svc.${{ env.IDP_NAMESPACE }}.svc.cluster.local:8080/realms/gaas/protocol/openid-connect/token"
+                      - name: GAAS_IDP_INTROSPECT_ENDPOINT
+                        value: "http://keycloak-svc.${{ env.IDP_NAMESPACE }}.svc.cluster.local:8080/realms/gaas/protocol/openid-connect/token/introspect"
+                      - name: GAAS_IDP_JWKS_URI
+                        value: "http://keycloak-svc.${{ env.IDP_NAMESPACE }}.svc.cluster.local:8080/realms/gaas/protocol/openid-connect/certs"
+                      - name: GAAS_IDP_AUTHORIZATION_ENDPOINT
+                        value: "http://keycloak-svc.${{ env.IDP_NAMESPACE }}.svc.cluster.local:8080/realms/gaas/protocol/openid-connect/auth"
+                      - name: GAAS_IDP_CALLBACK_BASE_URL
+                        value: "http://auth-service.${{ env.GAAS_NAMESPACE }}.svc.cluster.local:8081"
+                    readinessProbe:
+                      httpGet:
+                        path: /actuator/health
+                        port: 8081
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+          EOF
+
+          kubectl rollout status deployment/auth-service-stable \
+            -n ${{ env.GAAS_NAMESPACE }} --timeout=120s
+
+      # Create the base auth-service Service (required for Istio canary DestinationRule).
+      # Without this Service, the canary VirtualService has no host to attach to.
+      - name: Create auth-service base Service (for Istio canary)
+        run: |
+          kubectl create service clusterip auth-service \
+            --tcp=8081:8081 -n ${{ env.GAAS_NAMESPACE }} || true
+
+          # Also create the versioned services for canary traffic splitting
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: auth-service-stable-svc
+            namespace: ${{ env.GAAS_NAMESPACE }}
+          spec:
+            selector:
+              app: auth-service
+              version: stable
+            ports:
+              - port: 8081
+                targetPort: 8081
+          EOF
+
+      # ---- Smoke Tests ----
+      # Test M2M flow: Client Credentials grant should return a GaaS JWT
+      - name: Smoke test — M2M (Client Credentials)
+        env:
+          KEYCLOAK_GATEWAY_SECRET: ${{ secrets.KEYCLOAK_GATEWAY_SECRET }}
+        run: |
+          # Port-forward the auth service for smoke testing
+          kubectl port-forward svc/auth-service 8081:8081 -n ${{ env.GAAS_NAMESPACE }} &
+          AUTH_PF_PID=$!
+          sleep 5
+
+          # Test 1: Valid M2M token request (should return 200 + JWT)
+          RESPONSE=$(curl -sf -X POST http://localhost:8081/oauth2/token \
+            -d "grant_type=client_credentials" \
+            -d "client_id=gaas-gateway" \
+            -d "client_secret=${KEYCLOAK_GATEWAY_SECRET}" \
+            -d "scope=gateway:read")
+
+          ACCESS_TOKEN=$(echo "${RESPONSE}" | jq -r '.access_token')
+          if [[ "${ACCESS_TOKEN}" == "null" || -z "${ACCESS_TOKEN}" ]]; then
+            echo "✗ M2M token request failed: ${RESPONSE}"
+            kill $AUTH_PF_PID
+            exit 1
+          fi
+          echo "✓ M2M Client Credentials: JWT issued successfully"
+
+          # Test 2: Wrong secret should return 401
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            http://localhost:8081/oauth2/token \
+            -d "grant_type=client_credentials" \
+            -d "client_id=gaas-gateway" \
+            -d "client_secret=wrong-secret")
+          if [[ "${HTTP_CODE}" != "401" ]]; then
+            echo "✗ Expected 401 for wrong secret, got ${HTTP_CODE}"
+            kill $AUTH_PF_PID
+            exit 1
+          fi
+          echo "✓ Wrong client secret correctly rejected (401)"
+
+          # Test 3: Health endpoint should return 200
+          HEALTH=$(curl -sf http://localhost:8081/actuator/health | jq -r '.status')
+          if [[ "${HEALTH}" != "UP" ]]; then
+            echo "✗ Health check failed: ${HEALTH}"
+            kill $AUTH_PF_PID
+            exit 1
+          fi
+          echo "✓ Auth service health: UP"
+
+          kill $AUTH_PF_PID
+
+      # Test the Keycloak OIDC discovery endpoint (validates IdP integration)
+      - name: Smoke test — Keycloak OIDC discovery
+        run: |
+          kubectl port-forward svc/keycloak-svc 8080:8080 -n ${{ env.IDP_NAMESPACE }} &
+          KC_PF_PID=$!
+          sleep 5
+
+          DISCOVERY=$(curl -sf \
+            http://localhost:8080/realms/gaas/.well-known/openid-configuration)
+          ISSUER=$(echo "${DISCOVERY}" | jq -r '.issuer')
+
+          if [[ -z "${ISSUER}" || "${ISSUER}" == "null" ]]; then
+            echo "✗ Keycloak OIDC discovery failed: ${DISCOVERY}"
+            kill $KC_PF_PID
+            exit 1
+          fi
+          echo "✓ Keycloak OIDC discovery OK — Issuer: ${ISSUER}"
+
+          JWKS_URI=$(echo "${DISCOVERY}" | jq -r '.jwks_uri')
+          KEYS_COUNT=$(curl -sf "${JWKS_URI}" | jq '.keys | length')
+          if [[ "${KEYS_COUNT}" -lt 1 ]]; then
+            echo "✗ Keycloak JWKS is empty — no public keys found"
+            kill $KC_PF_PID
+            exit 1
+          fi
+          echo "✓ Keycloak JWKS has ${KEYS_COUNT} public key(s)"
+
+          kill $KC_PF_PID
+
+  # ============================================================
+  # Job 6: Canary Deploy (Istio traffic splitting)
+  # ============================================================
+  canary-deploy:
+    name: Canary Deploy (Istio)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Deploy the canary version of auth-service alongside the stable version.
+      # Istio's VirtualService shifts a percentage of traffic to the canary.
+      - name: Deploy auth-service canary
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: auth-service-canary
+            namespace: ${{ env.GAAS_NAMESPACE }}
+            labels:
+              app: auth-service
+              version: canary
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: auth-service
+                version: canary
+            template:
+              metadata:
+                labels:
+                  app: auth-service
+                  version: canary
+                annotations:
+                  sidecar.istio.io/inject: "true"
+              spec:
+                containers:
+                  - name: auth-service
+                    image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+                    ports:
+                      - containerPort: 8081
+                    env:
+                      - name: VAULT_TOKEN
+                        value: "${{ secrets.VAULT_TOKEN }}"
+                      - name: SPRING_CLOUD_VAULT_URI
+                        value: "http://vault.${{ env.VAULT_NAMESPACE }}.svc.cluster.local:8200"
+                      - name: GAAS_IDP_CLIENT_SECRET
+                        value: "${{ secrets.KEYCLOAK_AUTH_SERVICE_SECRET }}"
+          EOF
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: auth-service-canary-svc
+            namespace: ${{ env.GAAS_NAMESPACE }}
+          spec:
+            selector:
+              app: auth-service
+              version: canary
+            ports:
+              - port: 8081
+                targetPort: 8081
+          EOF
+
+      # Istio DestinationRule defines the subsets (stable vs canary)
+      # that the VirtualService can route traffic to.
+      - name: Apply Istio DestinationRule
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.istio.io/v1beta1
+          kind: DestinationRule
+          metadata:
+            name: auth-service-dr
+            namespace: ${{ env.GAAS_NAMESPACE }}
+          spec:
+            host: auth-service
+            subsets:
+              - name: stable
+                labels:
+                  version: stable
+              - name: canary
+                labels:
+                  version: canary
+          EOF
+
+      # Phase 1: 10% canary traffic
+      - name: "Canary phase 1: ${{ env.CANARY_INITIAL_WEIGHT }}% to canary"
+        run: |
+          STABLE_WEIGHT=$((100 - ${{ env.CANARY_INITIAL_WEIGHT }}))
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.istio.io/v1beta1
+          kind: VirtualService
+          metadata:
+            name: auth-service-vs
+            namespace: ${{ env.GAAS_NAMESPACE }}
+          spec:
+            hosts:
+              - auth-service
+            http:
+              - route:
+                  - destination:
+                      host: auth-service
+                      subset: stable
+                    weight: ${STABLE_WEIGHT}
+                  - destination:
+                      host: auth-service
+                      subset: canary
+                    weight: ${{ env.CANARY_INITIAL_WEIGHT }}
+          EOF
+          echo "Traffic: ${STABLE_WEIGHT}% stable / ${{ env.CANARY_INITIAL_WEIGHT }}% canary"
+          sleep 30  # Observe canary health for 30 seconds
+
+      - name: Validate canary at ${{ env.CANARY_INITIAL_WEIGHT }}%
+        run: |
+          ERROR_COUNT=$(kubectl logs -l app=auth-service,version=canary \
+            -n ${{ env.GAAS_NAMESPACE }} --since=30s 2>/dev/null | \
+            grep -c "ERROR\|Exception\|FATAL" || echo "0")
+          if [[ "${ERROR_COUNT}" -gt 2 ]]; then
+            echo "✗ Canary has ${ERROR_COUNT} errors — rolling back"
+            kubectl delete virtualservice auth-service-vs -n ${{ env.GAAS_NAMESPACE }} || true
+            exit 1
+          fi
+          echo "✓ Canary healthy at ${{ env.CANARY_INITIAL_WEIGHT }}% (${ERROR_COUNT} errors)"
+
+      # Phase 2: 50% canary traffic
+      - name: "Canary phase 2: ${{ env.CANARY_MID_WEIGHT }}% to canary"
+        run: |
+          STABLE_WEIGHT=$((100 - ${{ env.CANARY_MID_WEIGHT }}))
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.istio.io/v1beta1
+          kind: VirtualService
+          metadata:
+            name: auth-service-vs
+            namespace: ${{ env.GAAS_NAMESPACE }}
+          spec:
+            hosts:
+              - auth-service
+            http:
+              - route:
+                  - destination:
+                      host: auth-service
+                      subset: stable
+                    weight: ${STABLE_WEIGHT}
+                  - destination:
+                      host: auth-service
+                      subset: canary
+                    weight: ${{ env.CANARY_MID_WEIGHT }}
+          EOF
+          echo "Traffic: ${STABLE_WEIGHT}% stable / ${{ env.CANARY_MID_WEIGHT }}% canary"
+          sleep 30
+
+      - name: Validate canary at ${{ env.CANARY_MID_WEIGHT }}%
+        run: |
+          ERROR_COUNT=$(kubectl logs -l app=auth-service,version=canary \
+            -n ${{ env.GAAS_NAMESPACE }} --since=30s 2>/dev/null | \
+            grep -c "ERROR\|Exception\|FATAL" || echo "0")
+          if [[ "${ERROR_COUNT}" -gt 5 ]]; then
+            echo "✗ Canary has ${ERROR_COUNT} errors at 50% — rolling back to stable"
+            cat <<EOF | kubectl apply -f -
+          apiVersion: networking.istio.io/v1beta1
+          kind: VirtualService
+          metadata:
+            name: auth-service-vs
+            namespace: ${{ env.GAAS_NAMESPACE }}
+          spec:
+            hosts:
+              - auth-service
+            http:
+              - route:
+                  - destination:
+                      host: auth-service
+                      subset: stable
+                    weight: 100
+                  - destination:
+                      host: auth-service
+                      subset: canary
+                    weight: 0
+          EOF
+            exit 1
+          fi
+          echo "✓ Canary healthy at ${{ env.CANARY_MID_WEIGHT }}% (${ERROR_COUNT} errors)"
+
+      # Phase 3: 100% canary (full rollout)
+      - name: "Canary phase 3: ${{ env.CANARY_FINAL_WEIGHT }}% to canary (full rollout)"
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.istio.io/v1beta1
+          kind: VirtualService
+          metadata:
+            name: auth-service-vs
+            namespace: ${{ env.GAAS_NAMESPACE }}
+          spec:
+            hosts:
+              - auth-service
+            http:
+              - route:
+                  - destination:
+                      host: auth-service
+                      subset: stable
+                    weight: 0
+                  - destination:
+                      host: auth-service
+                      subset: canary
+                    weight: 100
+          EOF
+          echo "✓ Full rollout complete: 100% traffic on canary"
+
+          # Scale down the stable deployment — canary is now the production version
+          kubectl scale deployment/auth-service-stable \
+            --replicas=0 -n ${{ env.GAAS_NAMESPACE }}
+
+  # ============================================================
+  # Job 7: Terraform Apply (main branch only)
+  # ============================================================
+  terraform-apply:
+    name: Terraform Apply (main only)
+    runs-on: ubuntu-latest
+    needs: canary-deploy
+    # Only run on the main branch — not on feature branches or PRs.
+    # workflow_dispatch can also skip this with skip_terraform_apply=true.
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event.inputs.skip_terraform_apply != 'true'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        working-directory: gaas/terraform/
+        run: terraform init
+
+      # Download the plan artifact created in the terraform-plan job.
+      # This ensures we apply EXACTLY what was reviewed/planned — not a re-plan.
+      - name: Download Terraform plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: gaas/terraform/
+
+      # Apply the pre-computed plan. This creates/updates the AWS ALB, security groups,
+      # and target groups in the configured AWS account.
+      - name: Terraform Apply
+        working-directory: gaas/terraform/
+        run: |
+          terraform apply -auto-approve tfplan
+
+      # Output the ALB DNS name so downstream processes can configure DNS
+      - name: Output ALB DNS name
+        working-directory: gaas/terraform/
+        run: |
+          ALB_DNS=$(terraform output -raw load_balancer_dns)
+          echo "ALB DNS: ${ALB_DNS}"
+          echo "ALB_DNS=${ALB_DNS}" >> $GITHUB_OUTPUT

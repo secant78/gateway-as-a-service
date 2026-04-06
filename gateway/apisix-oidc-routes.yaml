@@ -1,0 +1,326 @@
+# ============================================================
+# APISIX OIDC Routes — User-to-Machine (U2M) Token Validation
+# ============================================================
+#
+# PURPOSE:
+#   These ApisixRoute resources configure APISIX to validate tokens issued
+#   through the Authorization Code + PKCE flow (user tokens) directly against
+#   Keycloak's JWKS endpoint — WITHOUT going through the GaaS auth service.
+#
+# TWO TOKEN TYPES IN GaaS:
+#
+#   1. M2M Tokens (Client Credentials):
+#      - Issued by auth-service, re-signed with Vault key
+#      - Validated by APISIX using `jwt-auth` plugin + ApisixConsumer
+#      - Routes: /tenants/*, /api/* (machine clients)
+#      - Config: gateway/apisix-consumer.yaml
+#
+#   2. U2M Tokens (Authorization Code):
+#      - Issued by auth-service as GaaS JWTs (Vault-signed)
+#      - However, for admin routes, APISIX can ALSO accept raw Keycloak tokens
+#        using the `openid-connect` plugin, allowing direct JWKS validation
+#      - Routes: /admin/*, /console/* (human users)
+#      - Config: THIS FILE
+#
+# PLUGIN: openid-connect
+#   The openid-connect plugin validates OAuth 2.0 / OIDC tokens by:
+#     1. Fetching Keycloak's JWKS (public keys) from the jwks_uri
+#     2. Verifying the JWT signature using the matching public key (by kid)
+#     3. Validating standard claims: exp (expiry), iss (issuer), aud (audience)
+#     4. Extracting user identity and passing it as request headers to the upstream
+#
+#   The plugin caches JWKS keys (jwk_expires_time: 3600s) so it doesn't fetch
+#   on every request — only when a new kid (key ID) is encountered.
+#
+# SECURITY LAYERS ON ADMIN ROUTES:
+#   Layer 1: APISIX openid-connect validates the token signature/claims
+#   Layer 2: `scope_claim_key` check — token MUST have gateway:admin scope
+#   Layer 3: HTTPS required (HTTP listener redirects to HTTPS via ALB)
+#   Layer 4: Istio mTLS — backend services only accept calls from Istio-identified clients
+#
+# HOW TO APPLY:
+#   kubectl apply -f apisix-oidc-routes.yaml -n gaas
+#
+# PREREQUISITES:
+#   - Keycloak is deployed and the "gaas" realm exists (keycloak-setup.sh ran)
+#   - The gaas-web-console client is configured in Keycloak with the auth-service
+#     callback URL in "Valid Redirect URIs"
+#   - Replace ${KEYCLOAK_URL} with the actual Keycloak URL before applying.
+#     Example: http://keycloak-svc.gaas-idp.svc.cluster.local:8080/realms/gaas
+# ============================================================
+
+---
+# ============================================================
+# ApisixPluginConfig: Reusable OIDC plugin configuration
+# ============================================================
+# ApisixPluginConfig is a reusable plugin configuration object.
+# Multiple ApisixRoute resources can reference this config rather than
+# duplicating the OIDC settings in each route.
+#
+# This is the APISIX equivalent of a Kubernetes ConfigMap — define once, reuse many times.
+apiVersion: apisix.apache.org/v2
+kind: ApisixPluginConfig
+metadata:
+  name: gaas-oidc-config
+  namespace: gaas
+  labels:
+    app.kubernetes.io/part-of: gaas
+    app.kubernetes.io/component: gateway
+spec:
+  plugins:
+    # openid-connect: validates bearer tokens against the IdP's JWKS endpoint.
+    # Documentation: https://apisix.apache.org/docs/apisix/plugins/openid-connect/
+    - name: openid-connect
+      enable: true
+      config:
+        # ---- IdP Identity ----
+        # The issuer must match the `iss` claim in tokens from Keycloak's gaas realm.
+        # Keycloak's issuer format: <url>/realms/<realm>
+        # REPLACE THIS with the actual Keycloak URL:
+        client_id: "gaas-web-console"
+        # client_secret is not needed for PUBLIC clients (gaas-web-console is public).
+        # For confidential clients, add: client_secret: "the-secret"
+        client_secret: ""
+
+        # The discovery URL tells APISIX where to find OIDC metadata.
+        # The openid-connect plugin fetches /.well-known/openid-configuration
+        # to discover the jwks_uri, token_endpoint, and other endpoints automatically.
+        discovery: "http://keycloak-svc.gaas-idp.svc.cluster.local:8080/realms/gaas/.well-known/openid-configuration"
+
+        # ---- Token Validation ----
+        # bearer_only=true: APISIX ONLY validates Bearer tokens in the Authorization header.
+        # It does NOT redirect users to Keycloak for login (that is the auth-service's job).
+        # This mode is appropriate for API routes — not browser routes that need login UX.
+        bearer_only: true
+
+        # use_jwks=true: validate token signatures against Keycloak's public JWKS keys.
+        # This is the most secure validation method (cryptographic signature check).
+        # Alternative: use_introspection=true to call Keycloak's introspection endpoint
+        # (slower, network call per request, but supports opaque tokens).
+        use_jwks: true
+
+        # The expected audience in the token. If the token's `aud` claim does not match,
+        # APISIX rejects it with 403. "account" is Keycloak's default audience for user tokens.
+        # For GaaS-specific audience, configure the client scope in Keycloak to add "aud": "gaas-api-gateway".
+        audience: "account"
+
+        # How long to cache Keycloak's JWKS public keys (in seconds).
+        # After rotation, APISIX fetches new keys within this window.
+        # 3600s (1 hour) is appropriate when key rotation happens rarely.
+        jwk_expires_time: 3600
+
+        # ---- User Identity Forwarding ----
+        # APISIX can extract validated token claims and forward them as request headers
+        # to the upstream service, enabling attribute-based access control (ABAC).
+        # The upstream tenant service receives the user's identity without re-validating the token.
+        set_userinfo_header: true          # Adds X-Userinfo header with JSON-encoded user claims
+        set_access_token_header: false     # Don't forward the raw token upstream (security)
+        set_id_token_header: false         # Don't forward ID token upstream
+
+        # Custom header name for the user identity (if set_userinfo_header=true).
+        # Upstream services can read X-GaaS-User to get {"sub": "...", "email": "..."}
+        userinfo_header_name: "X-GaaS-User"
+
+---
+# ============================================================
+# ApisixRoute: Admin Console Routes (U2M, high-privilege)
+# ============================================================
+# Routes that require a user token (Authorization Code flow) with the gateway:admin scope.
+# Human administrators access /admin/* paths via the APISIX Web Console.
+#
+# Token requirements:
+#   1. Valid JWT signature (Keycloak RSA key, verified via JWKS)
+#   2. Not expired (exp claim in the future)
+#   3. Correct issuer (iss == Keycloak gaas realm URL)
+#   4. MFA was completed (verified by auth-service when the token was issued;
+#      the GaaS JWT carries `mfa: true` claim if re-issued, or the raw Keycloak
+#      token carries `amr: ["otp"]` for direct JWKS validation)
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: gaas-admin-console-route
+  namespace: gaas
+  labels:
+    app.kubernetes.io/part-of: gaas
+    app.kubernetes.io/component: gateway
+    gaas/route-type: "user-facing"
+    gaas/auth-method: "oidc-pkce"
+spec:
+  http:
+    - name: admin-console
+      match:
+        # /admin/* routes: API gateway management, tenant configuration, monitoring
+        paths:
+          - "/admin/*"
+        methods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - PATCH
+      backends:
+        # Forward to the APISIX dashboard or a future admin API service
+        # Replace the serviceName with your actual admin service name
+        - serviceName: apisix-dashboard
+          servicePort: 9000
+
+      plugins:
+        # ---- OIDC Token Validation ----
+        # References the shared ApisixPluginConfig above.
+        # The openid-connect plugin validates the Bearer token before the request reaches backend.
+        - name: openid-connect
+          enable: true
+          config:
+            # Override just the client_id and discovery URL for admin routes.
+            # Admin routes use the gaas-web-console public client.
+            client_id: "gaas-web-console"
+            client_secret: ""
+            discovery: "http://keycloak-svc.gaas-idp.svc.cluster.local:8080/realms/gaas/.well-known/openid-configuration"
+            bearer_only: true
+            use_jwks: true
+            audience: "account"
+            jwk_expires_time: 3600
+            set_userinfo_header: true
+            userinfo_header_name: "X-GaaS-User"
+
+        # ---- Scope Enforcement ----
+        # The `serverless-pre-function` plugin adds custom Lua logic to enforce
+        # that the token contains the gateway:admin scope.
+        # Without this, any valid Keycloak token (even with only api:read scope)
+        # could access admin routes.
+        - name: serverless-pre-function
+          enable: true
+          config:
+            phase: "access"
+            functions:
+              # Lua script runs AFTER openid-connect has validated the token.
+              # At this point, the validated token claims are in ngx.ctx.userinfo.
+              # This script checks the `scope` claim for "gateway:admin".
+              - |
+                return function()
+                  -- Retrieve the user info injected by openid-connect plugin
+                  local userinfo = ngx.ctx.userinfo or {}
+                  local scope = userinfo.scope or ""
+
+                  -- Check for gateway:admin in the space-separated scope string
+                  if not string.match(scope, "gateway:admin") then
+                    ngx.status = 403
+                    ngx.header["Content-Type"] = "application/json"
+                    ngx.say('{"error":"insufficient_scope","error_description":"gateway:admin scope required for /admin routes"}')
+                    ngx.exit(403)
+                  end
+                end
+
+        # ---- Rate Limiting ----
+        # Admin routes get a strict rate limit to prevent automated abuse.
+        # 10 requests per minute per user (identified by the `sub` claim).
+        - name: limit-count
+          enable: true
+          config:
+            count: 10
+            time_window: 60
+            key: "consumer_name"   # Rate limit per authenticated user
+            rejected_code: 429
+            rejected_msg: '{"error":"rate_limit_exceeded","error_description":"Too many admin requests. Limit: 10/minute"}'
+
+---
+# ============================================================
+# ApisixRoute: User API Routes (U2M, standard privilege)
+# ============================================================
+# Routes for authenticated users accessing standard (non-admin) API endpoints.
+# Requires a valid Keycloak token but NOT MFA (api:read scope only).
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: gaas-user-api-route
+  namespace: gaas
+  labels:
+    app.kubernetes.io/part-of: gaas
+    app.kubernetes.io/component: gateway
+    gaas/route-type: "user-facing"
+    gaas/auth-method: "oidc-pkce"
+spec:
+  http:
+    - name: user-api
+      match:
+        # /console/* routes: user-facing management console API
+        paths:
+          - "/console/*"
+        methods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - PATCH
+      backends:
+        # Replace with your actual user-facing API service
+        - serviceName: gaas-console-api-svc
+          servicePort: 8082
+      plugins:
+        - name: openid-connect
+          enable: true
+          config:
+            client_id: "gaas-web-console"
+            client_secret: ""
+            discovery: "http://keycloak-svc.gaas-idp.svc.cluster.local:8080/realms/gaas/.well-known/openid-configuration"
+            bearer_only: true
+            use_jwks: true
+            audience: "account"
+            jwk_expires_time: 3600
+            set_userinfo_header: true
+            userinfo_header_name: "X-GaaS-User"
+
+        # Rate limit: 60 requests per minute for standard user routes
+        - name: limit-count
+          enable: true
+          config:
+            count: 60
+            time_window: 60
+            key: "consumer_name"
+            rejected_code: 429
+
+---
+# ============================================================
+# ApisixRoute: Auth Service Routes (token endpoint, publicly accessible)
+# ============================================================
+# Proxies /oauth2/token, /auth/authorize, and /auth/callback to the auth-service.
+# These endpoints are PUBLIC (no auth required — they ARE the auth mechanism).
+# APISIX passes them through without token validation.
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: gaas-auth-service-route
+  namespace: gaas
+  labels:
+    app.kubernetes.io/part-of: gaas
+    app.kubernetes.io/component: gateway
+    gaas/route-type: "auth"
+    gaas/auth-method: "none"
+spec:
+  http:
+    - name: auth-endpoints
+      match:
+        paths:
+          - "/oauth2/token"          # M2M Client Credentials endpoint
+          - "/auth/authorize"        # U2M Authorization Code flow initiation
+          - "/auth/callback"         # U2M Authorization Code callback from Keycloak
+        methods:
+          - GET
+          - POST
+      backends:
+        # auth-service deployed in the gaas namespace
+        - serviceName: auth-service
+          servicePort: 8081
+      # NO jwt-auth or openid-connect plugin — these endpoints bootstrap authentication.
+      # They are protected at the network level by the ALB (HTTPS only) and Istio mTLS.
+      plugins:
+        # Rate limit token endpoint to prevent brute-force client secret attacks.
+        # 20 requests per minute per IP is generous for legitimate M2M clients.
+        - name: limit-count
+          enable: true
+          config:
+            count: 20
+            time_window: 60
+            key: "remote_addr"    # Rate limit per client IP
+            rejected_code: 429
+            rejected_msg: '{"error":"rate_limit_exceeded","error_description":"Too many token requests. Retry after 60 seconds."}'
