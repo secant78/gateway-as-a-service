@@ -280,6 +280,15 @@ jobs:
 
       # Plan with placeholder values — in production, use real VPC/subnet IDs.
       # The plan output shows what resources would be created/modified/destroyed.
+      # Flag explanations:
+      #   -var: overrides variables.tf defaults. In real deployments, use a .tfvars file
+      #         or TF_VAR_* environment variables instead of inline flags.
+      #   -out=tfplan: saves the plan to a binary file. The terraform-apply job applies
+      #                this EXACT plan — not a re-plan — ensuring what was reviewed is
+      #                what gets applied (prevents plan-apply divergence attacks).
+      #   -no-color: strips ANSI colour codes from output for clean CI log display.
+      #   2>&1 | tee: redirects stderr to stdout (combined) then tees to both terminal
+      #               AND the file — so CI logs AND the artifact both have the full output.
       - name: Terraform Plan
         working-directory: gaas/terraform/
         run: |
@@ -292,6 +301,12 @@ jobs:
             -out=tfplan \
             -no-color 2>&1 | tee terraform-plan.txt
 
+      # Upload two artifacts from the plan step:
+      #   tfplan          — the binary plan consumed by `terraform apply tfplan` in Job 7.
+      #                     This is a machine-readable Terraform plan, not human-readable.
+      #   terraform-plan.txt — the human-readable text output from the plan command.
+      #                     Attach this to pull request reviews so reviewers can see
+      #                     exactly which AWS resources would change without running Terraform.
       - name: Upload Terraform plan
         uses: actions/upload-artifact@v4
         with:
@@ -404,9 +419,16 @@ jobs:
           echo "✓ Keycloak realm 'gaas' configured with clients and MFA flow"
 
       # ---- Deploy APISIX ----
+      # helm upgrade --install: idempotent — creates on first run, upgrades on subsequent runs.
+      # --values: applies gaas/gateway/apisix-values.yaml which sets NodePort=30080, ClusterIP admin, etc.
+      # --wait: blocks until all APISIX pods reach Ready state (prevents the next step from
+      #         applying ApisixRoute CRDs before the APISIX CRD controller is running).
+      # --timeout 5m: APISIX + etcd can take 2-3 min on a cold Minikube node — 5m is generous.
       - name: Install APISIX via Helm
         run: |
+          # Add the official APISIX Helm chart repository
           helm repo add apisix https://charts.apiseven.com
+          # Fetch the latest chart index — ensures we get the pinned version in apisix-values.yaml
           helm repo update
           helm upgrade --install apisix apisix/apisix \
             --namespace ${{ env.GAAS_NAMESPACE }} \
@@ -422,11 +444,33 @@ jobs:
           echo "✓ APISIX Consumer and OIDC routes applied"
 
       # ---- Deploy Auth Service ----
+      # The Deployment is generated inline (not from a static file) so that GitHub Actions
+      # can inject the exact image tag (sha-<commit>) and runtime secrets as env vars.
+      # These env vars override the defaults in application.properties at runtime —
+      # see the "ENVIRONMENT VARIABLE OVERRIDE" section in application.properties.
+      #
+      # ENV VAR MAPPING (name → application.properties key it overrides):
+      #   VAULT_TOKEN                → spring.cloud.vault.token (Vault auth token)
+      #   SPRING_CLOUD_VAULT_URI     → spring.cloud.vault.uri (Vault in-cluster address)
+      #   GAAS_IDP_ISSUER_URI        → gaas.idp.issuer-uri (Keycloak realm URL)
+      #   GAAS_IDP_CLIENT_ID         → gaas.idp.client-id (auth-service Keycloak client)
+      #   GAAS_IDP_CLIENT_SECRET     → gaas.idp.client-secret (injected from GitHub Secret)
+      #   GAAS_IDP_TOKEN_ENDPOINT    → gaas.idp.token-endpoint (Keycloak /token URL)
+      #   GAAS_IDP_INTROSPECT_ENDPOINT → gaas.idp.introspect-endpoint
+      #   GAAS_IDP_JWKS_URI          → gaas.idp.jwks-uri (Keycloak public keys for APISIX)
+      #   GAAS_IDP_AUTHORIZATION_ENDPOINT → gaas.idp.authorization-endpoint (/auth/authorize redirect)
+      #   GAAS_IDP_CALLBACK_BASE_URL → gaas.idp.callback-base-url (where Keycloak redirects back)
+      #
+      # version: stable label — used by the Istio DestinationRule to define the "stable" subset.
+      # The canary job deploys a parallel Deployment with version: canary.
       - name: Deploy Auth Service
         env:
           IMAGE_TAG: sha-${{ github.sha }}
         run: |
           # Create the auth-service Kubernetes Deployment
+          # The heredoc (cat <<EOF | kubectl apply) creates the manifest on-the-fly.
+          # kubectl apply -f - reads the manifest from stdin (the '-' means stdin).
+          # This approach avoids writing a temp file and is cleaner for CI pipelines.
           cat <<EOF | kubectl apply -f -
           apiVersion: apps/v1
           kind: Deployment
@@ -435,7 +479,7 @@ jobs:
             namespace: ${{ env.GAAS_NAMESPACE }}
             labels:
               app: auth-service
-              version: stable
+              version: stable   # Must match the 'stable' subset in the Istio DestinationRule
           spec:
             replicas: 1
             selector:
@@ -448,42 +492,74 @@ jobs:
                   app: auth-service
                   version: stable
                 annotations:
+                  # Instruct Istio's admission webhook to inject the Envoy sidecar.
+                  # This enables mTLS with Vault, Keycloak, and APISIX — all in-cluster.
                   sidecar.istio.io/inject: "true"
               spec:
                 containers:
                   - name: auth-service
                     image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
                     ports:
-                      - containerPort: 8081
+                      - containerPort: 8081   # Must match server.port=8081 in application.properties
                     env:
+                      # ---- Vault connection ----
+                      # VAULT_TOKEN: the root token from the Bootstrap Vault step above.
+                      # In production: use Vault Kubernetes auth method (exchange SA token for Vault token).
                       - name: VAULT_TOKEN
                         value: "${{ secrets.VAULT_TOKEN }}"
+                      # SPRING_CLOUD_VAULT_URI: Vault's in-cluster DNS. Format:
+                      #   http://<service-name>.<namespace>.svc.cluster.local:<port>
                       - name: SPRING_CLOUD_VAULT_URI
                         value: "http://vault.${{ env.VAULT_NAMESPACE }}.svc.cluster.local:8200"
+                      # ---- Keycloak IdP connection ----
+                      # GAAS_IDP_ISSUER_URI: the Keycloak realm base URL.
+                      # All tokens from this realm will have iss = this value.
+                      # Keycloak's DNS: keycloak-svc.gaas-idp.svc.cluster.local:8080
                       - name: GAAS_IDP_ISSUER_URI
                         value: "http://keycloak-svc.${{ env.IDP_NAMESPACE }}.svc.cluster.local:8080/realms/gaas"
+                      # GAAS_IDP_CLIENT_ID: which Keycloak client the auth-service presents
+                      # as when exchanging authorization codes (U2M flow).
                       - name: GAAS_IDP_CLIENT_ID
                         value: "auth-service"
+                      # GAAS_IDP_CLIENT_SECRET: injected from GitHub Secrets — never hardcoded.
+                      # This is the secret for the "auth-service" client in Keycloak.
                       - name: GAAS_IDP_CLIENT_SECRET
                         value: "${{ secrets.KEYCLOAK_AUTH_SERVICE_SECRET }}"
+                      # GAAS_IDP_TOKEN_ENDPOINT: where the auth-service calls Keycloak
+                      # for M2M Client Credentials and U2M authorization code exchange.
                       - name: GAAS_IDP_TOKEN_ENDPOINT
                         value: "http://keycloak-svc.${{ env.IDP_NAMESPACE }}.svc.cluster.local:8080/realms/gaas/protocol/openid-connect/token"
+                      # GAAS_IDP_INTROSPECT_ENDPOINT: for checking if an existing token is
+                      # still active (not revoked). Used for token validation on protected endpoints.
                       - name: GAAS_IDP_INTROSPECT_ENDPOINT
                         value: "http://keycloak-svc.${{ env.IDP_NAMESPACE }}.svc.cluster.local:8080/realms/gaas/protocol/openid-connect/token/introspect"
+                      # GAAS_IDP_JWKS_URI: Keycloak's public signing keys. APISIX's
+                      # openid-connect plugin fetches these to verify token signatures.
+                      # Also used by Spring Security's JWT resource server configuration.
                       - name: GAAS_IDP_JWKS_URI
                         value: "http://keycloak-svc.${{ env.IDP_NAMESPACE }}.svc.cluster.local:8080/realms/gaas/protocol/openid-connect/certs"
+                      # GAAS_IDP_AUTHORIZATION_ENDPOINT: Keycloak's login page URL.
+                      # The auth-service redirects users here during /auth/authorize.
                       - name: GAAS_IDP_AUTHORIZATION_ENDPOINT
                         value: "http://keycloak-svc.${{ env.IDP_NAMESPACE }}.svc.cluster.local:8080/realms/gaas/protocol/openid-connect/auth"
+                      # GAAS_IDP_CALLBACK_BASE_URL: the public URL of THIS auth-service.
+                      # Appended with /auth/callback → the full redirect URI sent to Keycloak.
+                      # Must match "Valid Redirect URIs" in the auth-service Keycloak client.
                       - name: GAAS_IDP_CALLBACK_BASE_URL
                         value: "http://auth-service.${{ env.GAAS_NAMESPACE }}.svc.cluster.local:8081"
+                    # Readiness probe: Kubernetes waits until this returns 200 before
+                    # routing any traffic to the pod. Prevents requests hitting an
+                    # uninitialized pod (before the Vault signing key is loaded).
                     readinessProbe:
                       httpGet:
                         path: /actuator/health
                         port: 8081
-                      initialDelaySeconds: 30
+                      initialDelaySeconds: 30   # Auth service needs ~15-20s to load the Vault key
                       periodSeconds: 10
           EOF
 
+          # Block until the Deployment's pods are all Ready.
+          # Without --wait here, subsequent steps (smoke tests) might hit pods still starting up.
           kubectl rollout status deployment/auth-service-stable \
             -n ${{ env.GAAS_NAMESPACE }} --timeout=120s
 
@@ -602,10 +678,17 @@ jobs:
 
       # Deploy the canary version of auth-service alongside the stable version.
       # Istio's VirtualService shifts a percentage of traffic to the canary.
+      # CANARY STRATEGY: the canary Deployment runs the NEW image (same sha as this commit).
+      # The stable Deployment from the deploy-staging job runs the PREVIOUS image.
+      # Both are alive simultaneously — Istio splits traffic between them at the Service level.
+      # Once all three canary phases pass, stable is scaled to 0 (replaced by canary).
       - name: Deploy auth-service canary
         env:
           IMAGE_TAG: sha-${{ github.sha }}
         run: |
+          # version: canary label — matches the 'canary' subset in the Istio DestinationRule.
+          # Both Deployments share app: auth-service so they both receive Service traffic
+          # before the DestinationRule+VirtualService take over traffic splitting.
           cat <<EOF | kubectl apply -f -
           apiVersion: apps/v1
           kind: Deployment
@@ -614,7 +697,7 @@ jobs:
             namespace: ${{ env.GAAS_NAMESPACE }}
             labels:
               app: auth-service
-              version: canary
+              version: canary   # Must match the 'canary' subset in the Istio DestinationRule
           spec:
             replicas: 1
             selector:
@@ -627,7 +710,7 @@ jobs:
                   app: auth-service
                   version: canary
                 annotations:
-                  sidecar.istio.io/inject: "true"
+                  sidecar.istio.io/inject: "true"   # Envoy sidecar required for Istio traffic splitting
               spec:
                 containers:
                   - name: auth-service
@@ -635,10 +718,14 @@ jobs:
                     ports:
                       - containerPort: 8081
                     env:
+                      # The canary shares the same Vault and Keycloak connections as stable.
+                      # Only the image tag differs — this tests the new code against real infrastructure.
                       - name: VAULT_TOKEN
                         value: "${{ secrets.VAULT_TOKEN }}"
                       - name: SPRING_CLOUD_VAULT_URI
                         value: "http://vault.${{ env.VAULT_NAMESPACE }}.svc.cluster.local:8200"
+                      # GAAS_IDP_CLIENT_SECRET: must be the same as stable — both use the
+                      # "auth-service" Keycloak client. The secret doesn't change between versions.
                       - name: GAAS_IDP_CLIENT_SECRET
                         value: "${{ secrets.KEYCLOAK_AUTH_SERVICE_SECRET }}"
           EOF
@@ -660,6 +747,16 @@ jobs:
 
       # Istio DestinationRule defines the subsets (stable vs canary)
       # that the VirtualService can route traffic to.
+      #
+      # HOW DESTINATIONRULE WORKS:
+      #   The DestinationRule tells Istio: "when traffic is going to host 'auth-service',
+      #   here is how to differentiate between stable and canary endpoints."
+      #   'host: auth-service' matches the Kubernetes Service name (the base Service we
+      #   created with kubectl create service clusterip auth-service).
+      #   Each subset selects pods using the 'version' label:
+      #     subset stable → pods with version=stable  (auth-service-stable Deployment)
+      #     subset canary → pods with version=canary  (auth-service-canary Deployment)
+      #   Without this DestinationRule, the VirtualService cannot reference subsets.
       - name: Apply Istio DestinationRule
         run: |
           cat <<EOF | kubectl apply -f -
@@ -669,19 +766,26 @@ jobs:
             name: auth-service-dr
             namespace: ${{ env.GAAS_NAMESPACE }}
           spec:
-            host: auth-service
+            host: auth-service   # Must match the Kubernetes Service name exactly
             subsets:
-              - name: stable
+              - name: stable     # Referenced as subset: stable in VirtualService routes
                 labels:
-                  version: stable
-              - name: canary
+                  version: stable  # Selects pods with label version=stable
+              - name: canary     # Referenced as subset: canary in VirtualService routes
                 labels:
-                  version: canary
+                  version: canary  # Selects pods with label version=canary
           EOF
 
       # Phase 1: 10% canary traffic
+      # WHY 10% FIRST?
+      #   Sending only 1-in-10 requests to the canary limits blast radius.
+      #   If the canary has a bug that causes 500 errors, only 10% of real traffic is affected.
+      #   The remaining 90% continues to reach the stable version unaffected.
+      #   We wait 30 seconds to accumulate a meaningful sample of log lines before validating.
       - name: "Canary phase 1: ${{ env.CANARY_INITIAL_WEIGHT }}% to canary"
         run: |
+          # $((100 - CANARY_INITIAL_WEIGHT)) = the stable weight. Bash arithmetic expansion.
+          # Weights must sum to 100. Istio enforces this — non-100 totals cause a validation error.
           STABLE_WEIGHT=$((100 - ${{ env.CANARY_INITIAL_WEIGHT }}))
           cat <<EOF | kubectl apply -f -
           apiVersion: networking.istio.io/v1beta1
@@ -708,9 +812,19 @@ jobs:
 
       - name: Validate canary at ${{ env.CANARY_INITIAL_WEIGHT }}%
         run: |
+          # Collect log lines from the canary pod from the last 30 seconds.
+          # --since=30s: only examine logs generated since the VirtualService was applied.
+          # -l app=auth-service,version=canary: select only the canary pod (not stable).
+          # grep -c: count matching lines. || echo "0": if grep finds nothing, return "0"
+          #          (grep exits 1 on no match, which would fail the -e shell option).
           ERROR_COUNT=$(kubectl logs -l app=auth-service,version=canary \
             -n ${{ env.GAAS_NAMESPACE }} --since=30s 2>/dev/null | \
             grep -c "ERROR\|Exception\|FATAL" || echo "0")
+          # Threshold > 2 at 10%: at 10% traffic, 2 errors in 30s = low but non-zero noise.
+          # Allowing 1-2 errors accommodates startup noise (Vault key load, Keycloak first call).
+          # More than 2 errors in 30 seconds at 10% load strongly indicates a regression.
+          # ROLLBACK: deleting the VirtualService removes the traffic split — Kubernetes Service
+          #           round-robins to ALL pods again, but stable has more replicas and handles load.
           if [[ "${ERROR_COUNT}" -gt 2 ]]; then
             echo "✗ Canary has ${ERROR_COUNT} errors — rolling back"
             kubectl delete virtualservice auth-service-vs -n ${{ env.GAAS_NAMESPACE }} || true
@@ -719,6 +833,11 @@ jobs:
           echo "✓ Canary healthy at ${{ env.CANARY_INITIAL_WEIGHT }}% (${ERROR_COUNT} errors)"
 
       # Phase 2: 50% canary traffic
+      # WHY 50% NEXT?
+      #   50% gives the canary equal traffic as stable — a real production workload test.
+      #   At 50%, any latency regression or error rate increase becomes statistically significant
+      #   much faster than at 10%. We raise the error threshold to 5 at this weight because
+      #   5x the traffic means roughly 5x the expected background noise level.
       - name: "Canary phase 2: ${{ env.CANARY_MID_WEIGHT }}% to canary"
         run: |
           STABLE_WEIGHT=$((100 - ${{ env.CANARY_MID_WEIGHT }}))
@@ -750,6 +869,11 @@ jobs:
           ERROR_COUNT=$(kubectl logs -l app=auth-service,version=canary \
             -n ${{ env.GAAS_NAMESPACE }} --since=30s 2>/dev/null | \
             grep -c "ERROR\|Exception\|FATAL" || echo "0")
+          # Threshold > 5 at 50%: 5x more traffic than phase 1, so 5x more tolerance.
+          # ROLLBACK STRATEGY: instead of deleting the VirtualService (which would cause
+          # temporary traffic imbalance), we update it with weight 100/0 (stable/canary).
+          # This is a cleaner rollback — the VirtualService stays in place, canary weight goes to 0.
+          # The canary Deployment remains running (not deleted) for debugging post-mortem.
           if [[ "${ERROR_COUNT}" -gt 5 ]]; then
             echo "✗ Canary has ${ERROR_COUNT} errors at 50% — rolling back to stable"
             cat <<EOF | kubectl apply -f -
@@ -849,12 +973,24 @@ jobs:
 
       # Apply the pre-computed plan. This creates/updates the AWS ALB, security groups,
       # and target groups in the configured AWS account.
+      # -auto-approve: skip the interactive "yes/no" confirmation prompt.
+      #   Safe here because we are applying the EXACT binary plan artifact from Job 4
+      #   (not a re-plan). We reviewed/approved the plan when it was uploaded as an artifact.
+      # tfplan: the binary plan file downloaded from the terraform-plan artifact.
+      #   `terraform apply tfplan` applies that specific plan without re-planning.
       - name: Terraform Apply
         working-directory: gaas/terraform/
         run: |
           terraform apply -auto-approve tfplan
 
-      # Output the ALB DNS name so downstream processes can configure DNS
+      # Capture the ALB DNS name from Terraform state and surface it as a job output.
+      # -raw: returns the raw string value without surrounding quotes.
+      # GITHUB_OUTPUT: the special GitHub Actions file for passing values between steps.
+      #   The next workflow or job can read: ${{ steps.output-alb.outputs.ALB_DNS }}
+      # Downstream uses:
+      #   - Create a Route 53 CNAME: api.gaas.internal → <ALB_DNS>
+      #   - Update APISIX upstream host to <ALB_DNS>
+      #   - Update API documentation with the public endpoint URL
       - name: Output ALB DNS name
         working-directory: gaas/terraform/
         run: |

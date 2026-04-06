@@ -257,26 +257,49 @@ spec:
         - serviceName: gaas-console-api-svc
           servicePort: 8082
       plugins:
+        # openid-connect plugin on the user-api route validates standard-privilege user tokens.
+        # Same configuration as the admin route, but WITHOUT the serverless-pre-function scope check.
+        # Any valid Keycloak token (including api:read only) can access /console/* endpoints.
+        # For finer-grained access control (e.g., resource-level permissions), the upstream
+        # gaas-console-api-svc can read the X-GaaS-User header and enforce its own RBAC.
         - name: openid-connect
           enable: true
           config:
-            client_id: "gaas-web-console"
-            client_secret: ""
+            client_id: "gaas-web-console"     # Must match the Keycloak public client created by keycloak-setup.sh
+            client_secret: ""                  # Empty string for public clients (no secret)
+            # OIDC discovery URL: APISIX fetches /.well-known/openid-configuration once
+            # and caches the jwks_uri, issuer, and other metadata from the response.
             discovery: "http://keycloak-svc.gaas-idp.svc.cluster.local:8080/realms/gaas/.well-known/openid-configuration"
+            # bearer_only: true — APISIX validates tokens but does NOT redirect users to login.
+            # If the token is missing or invalid, it returns 401 JSON (not a login redirect).
+            # The calling application is responsible for initiating the auth flow when it receives 401.
             bearer_only: true
+            # use_jwks: true — validates token signatures cryptographically against Keycloak's JWKS.
+            # Alternative: use_introspection (slower, makes a network call per request).
+            # JWKS validation is preferred for performance: verify locally, no extra round-trip.
             use_jwks: true
-            audience: "account"
-            jwk_expires_time: 3600
+            audience: "account"        # "account" is Keycloak's default aud for user tokens
+            jwk_expires_time: 3600     # Cache Keycloak public keys for 1 hour before refreshing
+            # set_userinfo_header: true — APISIX extracts validated claims from the token
+            # and forwards them as a JSON object in the X-GaaS-User header.
+            # The upstream API can read this header to get user identity (sub, email, scope)
+            # without re-validating the token. This is the APISIX-native alternative to
+            # having every upstream service do its own JWT validation.
             set_userinfo_header: true
-            userinfo_header_name: "X-GaaS-User"
+            userinfo_header_name: "X-GaaS-User"  # Upstream reads: req.headers["X-GaaS-User"]
 
-        # Rate limit: 60 requests per minute for standard user routes
+        # Rate limit: 60 requests per minute for standard user routes.
+        # 60 req/min = 1 req/second average, with burst headroom.
+        # This prevents a single user's runaway script from starving other users.
+        # key: "consumer_name" — the rate limit is per authenticated user (identified by
+        # the validated token's sub claim). Each user gets their own 60 req/min bucket.
+        # If the token is invalid (no consumer_name), this key falls back to remote_addr.
         - name: limit-count
           enable: true
           config:
             count: 60
             time_window: 60
-            key: "consumer_name"
+            key: "consumer_name"    # Per-user rate limit (from the validated JWT's sub claim)
             rejected_code: 429
 
 ---

@@ -209,6 +209,46 @@ log "  ✓ Admin token obtained"
 #   otpPolicyPeriod: 30 — New OTP code every 30 seconds
 log "Step 3: Creating '${REALM}' realm..."
 
+# JSON field reference — Keycloak Realm representation:
+#
+# TOKEN LIFETIME FIELDS:
+#   accessTokenLifespan:    3600s (1 hour) — how long access tokens are valid.
+#                           Matches gaas.jwt.expiry-seconds in application.properties.
+#                           Short-lived tokens reduce the damage window if a token is stolen.
+#   ssoSessionIdleTimeout:  1800s (30 min) — user session expires after 30 min of inactivity.
+#   ssoSessionMaxLifespan: 36000s (10 hours) — absolute maximum session length regardless of activity.
+#   accessCodeLifespan:       60s — the authorization code is valid for 60 seconds only.
+#                           An attacker who intercepts the redirect code has only 60s to use it.
+#
+# SECURITY FIELDS:
+#   rememberMe: false — disables "Remember Me" checkbox. All sessions expire on browser close.
+#   duplicateEmailsAllowed: false — prevents account enumeration via email registration.
+#   resetPasswordAllowed: false — disables self-service password reset (requires admin for dev safety).
+#   editUsernameAllowed: false — usernames are immutable. The `sub` claim is stable.
+#
+# BRUTE FORCE PROTECTION:
+#   bruteForceProtected: true — enables Keycloak's built-in login attempt throttling.
+#   permanentLockout: false — accounts are temporarily locked (not permanently) after failures.
+#                    Permanent lockout would require admin intervention to unlock.
+#   maxFailureWaitSeconds: 900 — after max failures, user must wait 15 minutes before retrying.
+#   minimumQuickLoginWaitSeconds: 60 — after a fast failure (< 1s), wait at least 60s.
+#                    Prevents high-speed automated login attempts.
+#   waitIncrementSeconds: 60 — each subsequent failure adds 60s more wait time (progressive backoff).
+#   quickLoginCheckMilliSeconds: 1000 — a login is "quick" if it takes less than 1s.
+#   maxDeltaTimeSeconds: 43200 — failure counter resets after 12 hours of no attempts.
+#   failureFactor: 5 — lock the account after 5 consecutive failed login attempts.
+#
+# OTP POLICY FIELDS (TOTP — RFC 6238):
+#   otpPolicyType: totp — Time-based OTP (changes every N seconds).
+#                  Alternative: hotp (counter-based, changes on each use).
+#   otpPolicyAlgorithm: HmacSHA1 — the HMAC algorithm. SHA1 is the RFC 6238 standard.
+#                        Google Authenticator, Authy, and Microsoft Authenticator all support it.
+#   otpPolicyDigits: 6 — standard 6-digit codes (1,000,000 possible values per window).
+#   otpPolicyPeriod: 30 — new code every 30 seconds (the RFC 6238 recommended interval).
+#   otpPolicyLookAheadWindow: 1 — Keycloak accepts the current code AND 1 code before/after.
+#                              This tolerates up to 30s clock skew between the server and the
+#                              user's authenticator app without requiring perfect time sync.
+#   otpPolicyInitialCounter: 0 — initial counter value for HOTP (irrelevant for TOTP).
 kc_create "/admin/realms" '{
   "realm": "'"${REALM}"'",
   "enabled": true,
@@ -260,6 +300,27 @@ done
 # Standard flow: disabled — no browser login for this machine client.
 # Direct access grants: disabled — password grant is disabled (security best practice).
 log "Step 5: Creating M2M clients..."
+
+# JSON field reference — Keycloak Client representation (M2M clients):
+#
+# CLIENT TYPE FIELDS:
+#   publicClient: false — this is a CONFIDENTIAL client. It has a client_secret.
+#                 Confidential clients can authenticate with client_id + client_secret.
+#                 Public clients have no secret (used for browser apps where code is visible).
+#
+# GRANT TYPE FIELDS (what OAuth flows this client is allowed to use):
+#   serviceAccountsEnabled: true  — enables Client Credentials grant (machine-to-machine).
+#                                   Without this, POSTing grant_type=client_credentials returns 400.
+#   standardFlowEnabled: false    — disables Authorization Code flow (no browser login for M2M).
+#   implicitFlowEnabled: false    — ALWAYS false. Implicit flow is deprecated (RFC 9700).
+#                                   Tokens in URL fragments are logged and cached by browsers.
+#   directAccessGrantsEnabled: false — disables Resource Owner Password Credentials grant
+#                                      (username + password directly to the client).
+#                                      ROPC is deprecated — use Client Credentials for M2M instead.
+#
+# defaultScopes: the scopes Keycloak grants when the client doesn't specify a scope parameter.
+#   These are the MAXIMUM scopes the client can ever receive.
+#   A client cannot request scopes not in this list — Keycloak returns an error.
 
 log "  Creating gaas-gateway (M2M, gateway:read + gateway:admin)..."
 kc_create "/admin/realms/${REALM}/clients" '{
@@ -454,6 +515,30 @@ log "        to require MFA for gateway:admin and api:write scope requests."
 # Use the Keycloak Admin API's /admin/realms/{realm}/users/{id}/credentials endpoint.
 log "Step 10: Creating development test user..."
 
+# JSON field reference — Keycloak User representation:
+#
+#   emailVerified: true — skips the email verification flow at first login.
+#                         For dev/test users this is fine. For production sign-ups,
+#                         set false so Keycloak sends a verification email.
+#   enabled: true — account is active. Set false to disable without deleting the user.
+#
+#   credentials[].type: "password" — sets an initial password for the user.
+#   credentials[].temporary: false — the user is NOT forced to change the password on first login.
+#                                    Set true in production so users must set their own password.
+#
+#   requiredActions: ["CONFIGURE_TOTP"] — on first login, Keycloak forces the user to scan
+#                   a QR code with an authenticator app before proceeding.
+#                   The QR code encodes: issuer, secret, algorithm (HmacSHA1), digits (6), period (30).
+#                   After scanning, Google Authenticator/Authy generates rotating codes.
+#                   Common requiredActions values:
+#                     "CONFIGURE_TOTP"   — set up OTP (what we use)
+#                     "UPDATE_PASSWORD"  — force password change
+#                     "VERIFY_EMAIL"     — email verification
+#                     "UPDATE_PROFILE"   — collect first/last name/email
+#
+#   realmRoles: — the roles assigned to this user. These appear as claims in the JWT
+#               when the user authenticates. Auth-service extracts these to populate
+#               the GaaS JWT's `scope` claim.
 kc_create "/admin/realms/${REALM}/users" '{
   "username": "gaas-dev-user",
   "email": "dev@gaas.internal",
@@ -478,6 +563,15 @@ kc_create "/admin/realms/${REALM}/users" '{
 # ============================================================
 log "Step 11: Creating high-privilege development test user..."
 
+# This user has ALL scopes including gateway:admin and api:write (high-privilege).
+# On first login, Keycloak requires CONFIGURE_TOTP — the user MUST set up an authenticator app.
+# After TOTP setup, the user's tokens will include amr: ["otp"] in the claims.
+# The auth-service then validates this amr value for gateway:admin and api:write requests.
+#
+# To test the MFA enforcement path WITHOUT a real TOTP device in CI:
+#   Use the Keycloak Admin API to pre-configure a TOTP credential programmatically:
+#   POST /admin/realms/gaas/users/{id}/credentials
+#   with type: "otp" and a known secret — then use a TOTP library to generate the code.
 kc_create "/admin/realms/${REALM}/users" '{
   "username": "gaas-admin-user",
   "email": "admin-user@gaas.internal",
