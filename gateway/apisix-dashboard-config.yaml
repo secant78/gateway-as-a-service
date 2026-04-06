@@ -1,7 +1,50 @@
+# ============================================================
+# APISIX Dashboard — Deployment, ConfigMap, Secret, and Service
+# ============================================================
+#
+# PURPOSE:
+#   Deploys the APISIX Dashboard — a web UI that provides a visual view of
+#   all configured routes, plugins, consumers, and upstream services.
+#   In the GaaS context this visualizes the "API-as-a-Service" model:
+#   operators can see all tenant routes and their JWT auth plugin configuration.
+#
+# WHY DEPLOYED SEPARATELY FROM THE APISIX HELM CHART?
+#   The main apisix-values.yaml has `dashboard.enabled: false`.
+#   We deploy the dashboard separately for three reasons:
+#     1. Independent access control — the dashboard can be restricted to VPN/admin
+#        IPs while the gateway (port 30080) is publicly accessible.
+#     2. Independent resource limits — the dashboard is a low-traffic UI;
+#        it doesn't need to share resource limits with the high-traffic gateway.
+#     3. Separate upgrade cycle — dashboard and gateway versions can be updated
+#        independently without a full Helm upgrade of the gateway.
+#
+# NETWORK ACCESS:
+#   The dashboard Service is ClusterIP — NOT accessible from outside the cluster.
+#   To access it locally: kubectl port-forward svc/apisix-dashboard 9000:9000 -n gaas
+#   Then open: http://localhost:9000
+#
+# RESOURCES IN THIS FILE:
+#   1. Secret          — the admin password (not stored in the ConfigMap/git)
+#   2. ConfigMap       — the dashboard conf.yaml configuration file
+#   3. Deployment      — runs the dashboard container
+#   4. Service         — stable DNS name for the dashboard within the cluster
+# ============================================================
+
 ---
-# APISIX Dashboard Admin Password Secret
-# The password is injected via a K8s Secret rather than hardcoded in the
-# ConfigMap, so that the ConfigMap can be committed to git safely.
+# Secret: Admin password for the APISIX Dashboard login page.
+#
+# WHY A SECRET AND NOT PLAIN TEXT IN THE CONFIGMAP?
+#   The ConfigMap (below) is committed to git and stored in Kubernetes etcd
+#   in plaintext. If the password were in the ConfigMap, it would be visible
+#   in the git history and in kubectl get configmap output.
+#
+#   By storing it in a Secret, we can:
+#     - Base64-encode it (Kubernetes stores Secret data as base64)
+#     - Inject it as an environment variable (the Deployment reads DASHBOARD_ADMIN_PASSWORD)
+#     - Rotate it by updating the Secret without touching the ConfigMap
+#
+# CHANGE THIS VALUE before deploying to any shared environment.
+# Generate a strong password: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 apiVersion: v1
 kind: Secret
 metadata:
@@ -12,12 +55,18 @@ metadata:
     app.kubernetes.io/part-of: gaas
 type: Opaque
 stringData:
-  # CHANGE THIS in production. The value here is a placeholder.
-  # Generate with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+  # Kubernetes auto-encodes stringData as base64 when storing.
+  # This placeholder must be replaced before any real deployment.
   admin-password: "gaas-dashboard-password-change-me"
 
 ---
-# Dashboard configuration (conf.yaml) stored as a ConfigMap
+# ConfigMap: contains the full dashboard conf.yaml configuration file.
+# This is mounted as a file inside the dashboard container at:
+#   /usr/local/apisix-dashboard/conf/conf.yaml
+#
+# The password is intentionally NOT hardcoded here — see Secret above.
+# The Deployment injects it as the DASHBOARD_ADMIN_PASSWORD env var, and the
+# dashboard binary substitutes $(DASHBOARD_ADMIN_PASSWORD) at runtime.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -30,36 +79,48 @@ data:
   conf.yaml: |
     conf:
       listen:
-        host: 0.0.0.0
-        port: 9000
+        host: 0.0.0.0   # Listen on all interfaces so the Kubernetes Service can reach it
+        port: 9000       # Dashboard UI port — access via kubectl port-forward or ClusterIP
+
       log:
         error_log:
-          level: warn
-          file_path: /dev/stderr
+          level: warn          # Only log warnings and errors (reduce noise)
+          file_path: /dev/stderr   # Log errors to stderr (captured by kubectl logs)
         access_log:
-          file_path: /dev/stdout
+          file_path: /dev/stdout   # Log HTTP requests to stdout (captured by kubectl logs)
+
       etcd:
+        # APISIX Dashboard reads its configuration FROM the same etcd that APISIX uses.
+        # It doesn't have its own config store — it's a view into APISIX's etcd.
+        # "apisix-etcd" is the DNS name of the etcd Service created by the APISIX Helm chart.
         endpoints:
           - apisix-etcd:2379
         mtls:
+          # mTLS is disabled for etcd because Istio's sidecar handles mTLS at the
+          # network layer. Vault-style etcd mTLS would require certificate management
+          # that conflicts with Istio's own certificate rotation.
           ca_file: ""
           cert_file: ""
           key_file: ""
-        prefix: /apisix
-        username: ""
+        prefix: /apisix  # All APISIX keys in etcd are prefixed with /apisix
+        username: ""     # No etcd authentication (protected by Istio mTLS instead)
         password: ""
 
     authentication:
-      # Dashboard has its own login — users authenticate here to see the API-as-a-Service view
+      # JWT secret used to sign the dashboard's OWN login sessions.
+      # This is SEPARATE from the JWT signing key used by the auth-service.
+      # Change this value — if left as default, session tokens are predictable.
       secret: gaas-dashboard-jwt-secret-change-me
-      expire_time: 3600
+      expire_time: 3600   # Dashboard session expires after 1 hour
       users:
         - username: admin
-          # Password is read from the Secret mounted at /etc/dashboard/admin-password
-          # The entrypoint script sets this at runtime — not hardcoded here.
+          # $(DASHBOARD_ADMIN_PASSWORD) is a shell-style variable substitution.
+          # The dashboard binary reads the DASHBOARD_ADMIN_PASSWORD env var at startup
+          # and substitutes it here. This avoids putting the plaintext password in the ConfigMap.
           password: "$(DASHBOARD_ADMIN_PASSWORD)"
 
 ---
+# Deployment: runs the APISIX Dashboard as a single-replica pod.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -70,46 +131,62 @@ metadata:
     app.kubernetes.io/part-of: gaas
     app.kubernetes.io/version: "3.0.1"
 spec:
-  replicas: 1
+  replicas: 1   # Single replica — the dashboard is a low-traffic admin UI
   selector:
     matchLabels:
-      app: apisix-dashboard
+      app: apisix-dashboard   # Links the Deployment to its pods
   template:
     metadata:
       labels:
         app: apisix-dashboard
       annotations:
+        # Include the dashboard pod in the Istio service mesh.
+        # Dashboard → etcd traffic will be covered by STRICT mTLS.
         sidecar.istio.io/inject: "true"
     spec:
       containers:
         - name: apisix-dashboard
+          # Pin to a specific version — avoids surprising behavior changes from `latest`
           image: apache/apisix-dashboard:3.0.1-alpine
           ports:
             - containerPort: 9000
               name: dashboard
           env:
+            # Inject the admin password from the Secret into the container's environment.
+            # The dashboard reads this env var and substitutes it into the conf.yaml template.
             - name: DASHBOARD_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: apisix-dashboard-admin
-                  key: admin-password
+                  name: apisix-dashboard-admin   # Secret name (matches metadata.name above)
+                  key: admin-password            # Key within the Secret's data map
           volumeMounts:
+            # Mount the ConfigMap as a file at the path the dashboard expects.
+            # subPath: conf.yaml means ONLY the conf.yaml key is mounted, not the whole ConfigMap.
+            # Without subPath, the entire ConfigMap is mounted as a directory, which would
+            # replace the /usr/local/apisix-dashboard/conf/ directory and remove other files.
             - name: config
               mountPath: /usr/local/apisix-dashboard/conf/conf.yaml
               subPath: conf.yaml
           resources:
+            # Dashboard is a lightweight web UI — small resource limits are appropriate.
             requests:
-              cpu: 50m
+              cpu: 50m      # 0.05 CPU cores
               memory: 64Mi
             limits:
-              cpu: 200m
+              cpu: 200m     # 0.2 CPU cores maximum
               memory: 128Mi
       volumes:
+        # Define the volume that maps the ConfigMap into the container.
+        # volumeMounts (above) references this volume by name.
         - name: config
           configMap:
-            name: apisix-dashboard-config
+            name: apisix-dashboard-config   # Must match the ConfigMap metadata.name above
 
 ---
+# Service: provides a stable ClusterIP and DNS name for the dashboard.
+# Access the dashboard: kubectl port-forward svc/apisix-dashboard 9000:9000 -n gaas
+# Then browse to: http://localhost:9000
+# Login with username "admin" and the password from the apisix-dashboard-admin Secret.
 apiVersion: v1
 kind: Service
 metadata:
@@ -120,9 +197,9 @@ metadata:
     app.kubernetes.io/part-of: gaas
 spec:
   selector:
-    app: apisix-dashboard
+    app: apisix-dashboard   # Routes to pods with this label
   ports:
     - name: dashboard
-      port: 9000
-      targetPort: 9000
-  type: ClusterIP
+      port: 9000        # External port (what callers use)
+      targetPort: 9000  # Container port (must match containerPort above)
+  type: ClusterIP        # Not exposed externally — access via port-forward only

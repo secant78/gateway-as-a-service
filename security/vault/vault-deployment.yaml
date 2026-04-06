@@ -1,20 +1,64 @@
+# ============================================================
+# HashiCorp Vault — Kubernetes Deployment (Dev Mode)
+# ============================================================
+#
+# PURPOSE:
+#   Runs HashiCorp Vault inside Kubernetes to manage the JWT signing key
+#   for the GaaS auth service. Vault is the single authoritative source
+#   for all secrets — the auth-service reads the signing key from here
+#   rather than storing it in a config file or environment variable.
+#
+# WHY VAULT?
+#   Without Vault, the signing key would be stored as a Kubernetes Secret
+#   or environment variable — both are base64-encoded in etcd but not
+#   encrypted. Vault provides:
+#     - Encryption at rest (all secrets encrypted with a master key)
+#     - Fine-grained access control (policies define exactly who can read what)
+#     - Audit logging (every read and write is logged)
+#     - Automatic secret rotation (key versioning via KV v2)
+#
+# DEV MODE — INTENTIONAL DESIGN DECISION:
+#   Vault is started with the `-dev` flag, which means:
+#     ✓ No unseal ceremony required (normally Vault is "sealed" on startup
+#       and requires manual unseal keys to become operational)
+#     ✓ Root token is known and static (gaas-dev-root)
+#     ✓ In-memory storage (all secrets lost on pod restart)
+#     ✓ KV v1 secrets engine enabled by default at "secret/"
+#     ✓ Single command to start — no complex initialization
+#
+#   This is appropriate for:
+#     - Minikube local development
+#     - Ephemeral CI runners where the cluster is torn down after the job
+#
+#   PRODUCTION UPGRADE PATH (when ready to use real secrets):
+#     1. Remove the `-dev` flag and `-dev-root-token-id` from args
+#     2. Add a StatefulSet with a PersistentVolumeClaim for /vault/data
+#     3. Add a config.hcl ConfigMap with storage "file" { path = "/vault/data" }
+#     4. Configure auto-unseal: storage { seal "awskms" { region = "us-east-1" kms_key_id = "..." } }
+#     5. Replace root token with Vault's Kubernetes auth method:
+#        vault auth enable kubernetes
+#        vault write auth/kubernetes/config kubernetes_host=https://$KUBERNETES_PORT_443_TCP_ADDR:443
+#        vault write auth/kubernetes/role/gaas-auth bound_service_account_names=auth-service ...
+#
+# NETWORK TOPOLOGY:
+#   auth-service (gaas namespace) → calls vault.gaas-vault.svc.cluster.local:8200
+#   The Istio sidecar in BOTH pods handles the mTLS handshake transparently.
+#   Vault does NOT need to be configured for TLS — Envoy handles it.
+# ============================================================
+
 ---
-# Vault Dev-Mode Deployment
-# ============================================================
-# DESIGN DECISION: Dev mode is intentional for this environment.
-# Dev mode eliminates the unseal ceremony and makes the root token
-# immediately available — appropriate for ephemeral CI runners and
-# Minikube demo clusters where there is no persistent state to protect.
+# Kubernetes Secret holding the Vault dev root token.
+# This is injected into the Vault container as the VAULT_DEV_ROOT_TOKEN_ID env var
+# AND is used by the CI pipeline to authenticate against Vault for bootstrapping.
 #
-# PRODUCTION UPGRADE PATH:
-#   1. Replace `server -dev` with `server` (no -dev flag)
-#   2. Add a PersistentVolumeClaim for /vault/data
-#   3. Configure auto-unseal via AWS KMS or Azure Key Vault in config.hcl
-#   4. Use Vault's Kubernetes auth method instead of root token
+# WHY A SECRET AND NOT A HARDCODED ENV VAR?
+#   Even though this is a dev token with no real security value, using a Secret:
+#     - Makes it easy to rotate (update the Secret, restart the pod)
+#     - Follows the same pattern you'd use in production (where the value is real)
+#     - Allows the CI pipeline to read it programmatically via kubectl
 #
-# Root token `gaas-dev-root` is injected into CI via a Kubernetes Secret
-# named `vault-dev-token` in the `gaas-vault` namespace.
-# ============================================================
+# NOTE: In production, this Secret would NOT exist — the root token should never
+# be known. The Kubernetes auth method would be used instead.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -23,13 +67,16 @@ metadata:
   labels:
     app: vault
     app.kubernetes.io/part-of: gaas
-type: Opaque
+type: Opaque   # Generic secret type — the data field contains arbitrary key-value pairs
 stringData:
-  # In production this would NOT be a static value.
-  # It is acceptable here because dev-mode Vault has no durable secrets.
-  token: "gaas-dev-root"
+  # stringData is automatically base64-encoded when Kubernetes stores it.
+  # Reading it back via kubectl get secret gives you the base64 value.
+  token: "gaas-dev-root"   # The Vault root token. CHANGE THIS in any real environment.
 
 ---
+# The Vault application Deployment.
+# One replica is sufficient for dev — Vault in dev mode has no HA (high availability)
+# support anyway since it stores everything in memory.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -41,97 +88,136 @@ metadata:
     app.kubernetes.io/part-of: gaas
     app.kubernetes.io/version: "1.16"
 spec:
-  replicas: 1
+  replicas: 1   # Dev mode does not support more than 1 replica (no shared storage)
   selector:
     matchLabels:
-      app: vault
+      app: vault   # The Deployment finds its pods using this label selector
   template:
     metadata:
       labels:
         app: vault
         app.kubernetes.io/name: vault
       annotations:
-        # Explicitly opt into Istio sidecar injection even though
-        # the namespace label already enables it. Belt-and-suspenders.
+        # Belt-and-suspenders: the gaas-vault namespace already has istio-injection: enabled,
+        # but this annotation makes the intent explicit at the pod level.
+        # If someone removes the namespace label, pods with this annotation still get a sidecar.
         sidecar.istio.io/inject: "true"
     spec:
+      # The Vault pod runs with the `vault` ServiceAccount (created at the bottom of this file).
+      # In production, this ServiceAccount would be granted the Vault Kubernetes auth role.
       serviceAccountName: vault
       containers:
         - name: vault
+          # Pin to a specific version (not `latest`) for reproducibility.
+          # Upgrading Vault requires testing the new version first.
           image: hashicorp/vault:1.16
           args:
-            - "server"
-            - "-dev"
-            - "-dev-root-token-id=$(VAULT_DEV_ROOT_TOKEN_ID)"
-            - "-dev-listen-address=0.0.0.0:8200"
+            - "server"                                    # Run in server mode (as opposed to vault client commands)
+            - "-dev"                                      # Enable dev mode (see design decision above)
+            - "-dev-root-token-id=$(VAULT_DEV_ROOT_TOKEN_ID)"  # Set the root token from the Secret
+            - "-dev-listen-address=0.0.0.0:8200"         # Listen on all interfaces (needed for the K8s Service to reach it)
           ports:
             - name: vault-api
-              containerPort: 8200
+              containerPort: 8200    # Main Vault API port — all vault CLI and SDK calls go here
               protocol: TCP
             - name: vault-cluster
-              containerPort: 8201
+              containerPort: 8201    # Vault cluster communication port (for HA Raft storage — unused in dev)
               protocol: TCP
           env:
+            # Read the root token from the Kubernetes Secret created above.
+            # valueFrom.secretKeyRef is the Kubernetes-native way to inject secrets as env vars.
+            # The value is base64-decoded automatically before being set in the container's environment.
             - name: VAULT_DEV_ROOT_TOKEN_ID
               valueFrom:
                 secretKeyRef:
-                  name: vault-dev-token
-                  key: token
+                  name: vault-dev-token    # Secret name (must match metadata.name above)
+                  key: token               # Key within the Secret's data map
+            # Tell the Vault binary itself to listen on all interfaces.
+            # Without 0.0.0.0, Vault defaults to 127.0.0.1 which is only reachable within
+            # the container — the Kubernetes Service wouldn't be able to forward traffic to it.
             - name: VAULT_DEV_LISTEN_ADDRESS
               value: "0.0.0.0:8200"
+            # VAULT_ADDR is used by the Vault CLI when running commands inside the container.
+            # For example: kubectl exec vault-pod -- vault status
+            # 127.0.0.1 works here because the CLI runs inside the same container.
             - name: VAULT_ADDR
               value: "http://127.0.0.1:8200"
           resources:
+            # requests: the minimum resources Kubernetes will reserve for this pod on a node.
+            # limits: the maximum resources this pod is allowed to use.
+            # Vault in dev mode is lightweight — these are conservative values.
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 100m      # 100 millicores = 0.1 CPU cores (idle)
+              memory: 128Mi  # 128 MiB minimum
             limits:
-              cpu: 500m
-              memory: 256Mi
+              cpu: 500m      # 0.5 CPU cores maximum
+              memory: 256Mi  # 256 MiB maximum
           securityContext:
-            # IPC_LOCK is required by Vault to prevent sensitive memory pages
-            # (containing unsealed key material) from being swapped to disk.
-            # Without this capability, Vault logs a warning and may panic
-            # on memory-constrained nodes.
             capabilities:
               add:
+                # IPC_LOCK allows Vault to use mlock() to prevent sensitive memory pages
+                # (containing unsealed key material, token values, etc.) from being swapped
+                # to disk by the OS. If pages containing secrets are swapped out, an attacker
+                # with disk access could recover them.
+                # Without IPC_LOCK, Vault logs a warning:
+                #   "WARNING! mlock is not supported on this system!"
+                # and in some configurations may refuse to start.
                 - IPC_LOCK
+          # Readiness probe: Kubernetes stops sending traffic to this pod until it passes.
+          # Vault's /v1/sys/health returns:
+          #   200 = initialized, unsealed, active
+          #   429 = standby (only in HA mode)
+          #   501 = not initialized
+          #   503 = sealed
+          # Dev mode is always initialized and active, so 200 is expected.
           readinessProbe:
             httpGet:
               path: /v1/sys/health
               port: 8200
-              scheme: HTTP
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            failureThreshold: 3
+              scheme: HTTP    # Dev mode uses HTTP (no TLS — Istio sidecar handles TLS)
+            initialDelaySeconds: 5   # Wait 5s after container start before first probe
+            periodSeconds: 5         # Check every 5 seconds
+            failureThreshold: 3      # Mark unready after 3 consecutive failures
+          # Liveness probe: Kubernetes restarts the pod if this fails.
+          # ?standbyok=true means return 200 for standby nodes (relevant in HA mode only)
           livenessProbe:
             httpGet:
               path: /v1/sys/health?standbyok=true
               port: 8200
               scheme: HTTP
-            initialDelaySeconds: 15
-            periodSeconds: 10
+            initialDelaySeconds: 15  # Give Vault 15s to start before liveness checks begin
+            periodSeconds: 10        # Check every 10 seconds
 
 ---
+# Kubernetes Service: provides a stable DNS name and IP for the Vault pod.
+# Without this, callers would need to know the pod's IP, which changes on restart.
+# With this Service, callers use: http://vault.gaas-vault.svc.cluster.local:8200
+#
+# ClusterIP type means this Service is only reachable from within the cluster —
+# Vault is never exposed externally. Only pods with Istio identities can connect (STRICT mTLS).
 apiVersion: v1
 kind: Service
 metadata:
-  name: vault
+  name: vault       # This name forms the DNS hostname: vault.gaas-vault.svc.cluster.local
   namespace: gaas-vault
   labels:
     app: vault
     app.kubernetes.io/part-of: gaas
 spec:
   selector:
-    app: vault
+    app: vault      # Routes traffic to pods with this label (matches the Deployment's pods)
   ports:
     - name: vault-api
-      port: 8200
-      targetPort: 8200
+      port: 8200        # The port callers use (what's in the URL)
+      targetPort: 8200  # The port on the pod container (must match containerPort above)
       protocol: TCP
-  type: ClusterIP
+  type: ClusterIP   # Internal-only — not accessible from outside the cluster
 
 ---
+# ServiceAccount: gives the Vault pod a Kubernetes identity.
+# In production, this ServiceAccount is used with Vault's Kubernetes auth method
+# so that other pods can exchange their ServiceAccount tokens for Vault tokens.
+# In dev mode, this is primarily for good practice and future-proofing.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

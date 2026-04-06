@@ -1,6 +1,41 @@
+# ============================================================
+# Helm Template: RoleBinding
+# ============================================================
+#
+# PURPOSE:
+#   Connects ("binds") the Role to the ServiceAccount, granting the
+#   ServiceAccount the permissions defined in the Role.
+#
+# THE RBAC CHAIN:
+#   Without ALL THREE of these resources, RBAC has no effect:
+#
+#   ServiceAccount  →  RoleBinding  →  Role
+#   (who you are)      (the link)      (what you can do)
+#
+#   The RoleBinding is the glue. It says:
+#   "The ServiceAccount named <release-name>-sa in namespace <ns>
+#    has the permissions defined in the Role named <release-name>-tenant-role"
+#
+# CRITICAL CONSISTENCY REQUIREMENT:
+#   The roleRef.name MUST exactly match the Role name from role.yaml.
+#   The subjects[0].name MUST exactly match the ServiceAccount name from serviceaccount.yaml.
+#   Both use the same formula: {{ default (printf "%s-sa" .Release.Name) .Values.serviceAccount.name }}
+#   and {{ .Release.Name }}-tenant-role respectively.
+#
+#   If these drift (e.g., someone changes one but not the other), the binding
+#   silently becomes orphaned — the ServiceAccount has no permissions and the
+#   RBAC audit script (ops/rbac_audit.py) will report a "broken link" finding.
+#
+# NAMESPACE SCOPING:
+#   This RoleBinding is namespace-scoped (kind: RoleBinding, not ClusterRoleBinding).
+#   The permissions granted only apply within .Release.Namespace.
+#   Even if the Role referenced is a ClusterRole, the permissions are still
+#   limited to this namespace when using a RoleBinding (not ClusterRoleBinding).
+# ============================================================
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: RoleBinding   # NOT ClusterRoleBinding — scoped to this namespace only
 metadata:
+  # Binding name: <release-name>-tenant-rolebinding (e.g., "acme-corp-tenant-rolebinding")
   name: {{ .Release.Name }}-tenant-rolebinding
   namespace: {{ .Release.Namespace }}
   labels:
@@ -8,12 +43,16 @@ metadata:
     app.kubernetes.io/part-of: gaas
     gaas/tenant-id: {{ required "tenantId is required" .Values.tenantId | quote }}
 roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  # Must match the Role name created in role.yaml exactly
+  apiGroup: rbac.authorization.k8s.io   # Always this value for RBAC resources
+  kind: Role                             # Referencing a namespace-scoped Role (not ClusterRole)
+  # MUST match the name in role.yaml exactly:
+  # {{ .Release.Name }}-tenant-role (e.g., "acme-corp-tenant-role")
   name: {{ .Release.Name }}-tenant-role
 subjects:
   - kind: ServiceAccount
-    # Must match the ServiceAccount name created in serviceaccount.yaml exactly
+    # MUST match the ServiceAccount name in serviceaccount.yaml exactly.
+    # Uses the same default formula: <release-name>-sa
     name: {{ default (printf "%s-sa" .Release.Name) .Values.serviceAccount.name }}
+    # The ServiceAccount must be in the same namespace as this RoleBinding.
+    # Cross-namespace subjects are possible but not used here (single-namespace isolation model).
     namespace: {{ .Release.Namespace }}

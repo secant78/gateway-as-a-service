@@ -1,11 +1,48 @@
-# ResourceQuota enforces namespace-level resource limits.
-# This prevents a single tenant from exhausting cluster capacity
-# even if they set very high limits in their own Pod specs.
-# The quota values mirror the per-pod limits so a single-replica
-# deployment can always schedule, while preventing uncontrolled scaling.
+# ============================================================
+# Helm Template: ResourceQuota
+# ============================================================
+#
+# PURPOSE:
+#   Enforces a hard ceiling on total resource consumption for the entire
+#   tenant namespace — preventing one tenant from exhausting cluster capacity
+#   and starving other tenants ("noisy neighbor" problem).
+#
+# TWO LAYERS OF RESOURCE ENFORCEMENT:
+#   Layer 1 — Per-Pod (Deployment container spec in deployment.yaml):
+#     resources.requests and resources.limits on each container.
+#     Enforced by the kubelet on the node. If a container exceeds its memory
+#     limit, the kernel OOMKills it. If it exceeds CPU limit, it's throttled.
+#
+#   Layer 2 — Per-Namespace (THIS ResourceQuota):
+#     Total requests and limits across ALL pods in the namespace.
+#     Enforced by the Kubernetes API server at creation time.
+#     If a new Pod would push the namespace over the quota, the API server
+#     rejects the Pod creation request — the scheduler never sees it.
+#
+#   Both layers together prevent:
+#     - A single runaway pod consuming too many resources (Layer 1)
+#     - A tenant deploying 100 replicas to bypass per-pod limits (Layer 2)
+#
+# QUOTA VALUES STRATEGY:
+#   The quota is set to 4x the per-pod request values.
+#   This allows:
+#     - 1 pod running normally + 1 pod during a rolling update (2x headroom)
+#     - 2x additional buffer for burst/scale events
+#   The 4x multiplier means a single tenant can never use more than
+#   4 * requests.cpu = 4 * 100m = 400m across all pods in the namespace.
+#
+# HELM TEMPLATE MATH:
+#   mul 4 (trimSuffix "m" .Values.resources.requests.cpu | int)
+#   Step 1: trimSuffix "m" "100m" → "100"
+#   Step 2: int "100"             → 100 (integer)
+#   Step 3: mul 4 100             → 400
+#   Step 4: printf "%dm" 400      → "400m"
+#   Result: requests.cpu quota = "400m"
+# ============================================================
 apiVersion: v1
 kind: ResourceQuota
 metadata:
+  # Quota name: <release-name>-quota (e.g., "acme-corp-quota")
   name: {{ .Release.Name }}-quota
   namespace: {{ .Release.Namespace }}
   labels:
@@ -14,12 +51,28 @@ metadata:
     gaas/tenant-id: {{ required "tenantId is required" .Values.tenantId | quote }}
 spec:
   hard:
-    # CPU: allow up to 4x the per-pod request (headroom for rolling updates)
+    # CPU quota: 4x the per-pod CPU request value.
+    # trimSuffix strips the "m" unit, int converts to integer, mul multiplies, printf re-adds "m".
+    # Example: resources.requests.cpu = "100m" → quota = "400m"
     requests.cpu: {{ mul 4 (trimSuffix "m" .Values.resources.requests.cpu | int) | printf "%dm" }}
+
+    # Memory quota: same as the per-pod memory request.
+    # This allows one pod at full request; scale up if tenants need multiple replicas.
     requests.memory: {{ .Values.resources.requests.memory }}
+
+    # CPU and memory limits quota: matches the per-pod limits.
+    # This is the absolute ceiling — no single pod can exceed the per-pod limit,
+    # and the namespace cannot exceed this total.
     limits.cpu: {{ .Values.resources.limits.cpu }}
     limits.memory: {{ .Values.resources.limits.memory }}
-    # Prevent unbounded pod proliferation
+
+    # Pod count limit: prevent unbounded replication attacks.
+    # Even if resource limits allow it, a tenant cannot create more than 5 pods.
     pods: "5"
+
+    # Service count limit: prevent service discovery flooding.
     services: "3"
+
+    # PVC limit: tenants shouldn't need persistent storage in this use case.
+    # Allowing 2 gives flexibility for stateful tenant workloads if needed.
     persistentvolumeclaims: "2"

@@ -1,7 +1,21 @@
 # ============================================================
-# APISIX Helm Values — GaaS Gateway Layer
+# APISIX Helm Values — GaaS API Gateway Configuration
 # ============================================================
-# Install command:
+#
+# PURPOSE:
+#   This file customizes the official APISIX Helm chart for the GaaS environment.
+#   It is passed to `helm install` via the -f flag and overrides the chart defaults.
+#
+# WHAT IS APISIX?
+#   Apache APISIX is a high-performance API gateway. In GaaS it acts as the
+#   single entry point for ALL tenant API traffic. Every request from the internet
+#   passes through APISIX, which:
+#     1. Validates the JWT Bearer token (jwt-auth plugin)
+#     2. Routes the request to the correct tenant service (ApisixRoute)
+#     3. Enforces rate limits, retries, and circuit breakers
+#     4. Logs request metadata for observability
+#
+# HOW TO INSTALL:
 #   helm repo add apisix https://charts.apiseven.com
 #   helm repo update
 #   helm install apisix apisix/apisix \
@@ -9,79 +23,101 @@
 #     --create-namespace \
 #     -f apisix-values.yaml
 #
-# DESIGN DECISION: NodePort for Minikube vs LoadBalancer for cloud
-#   Minikube does not resolve `LoadBalancer` IPs without running
-#   `minikube tunnel` as a background daemon. NodePort is reliable
-#   and predictable on Minikube. For cloud deployments, Terraform
-#   provisions an ALB that forwards traffic to this NodePort.
+# DESIGN DECISION — NodePort vs LoadBalancer:
+#   On Minikube, `LoadBalancer` type Services never get an external IP assigned
+#   unless you run `minikube tunnel` as a background process. This is fragile
+#   in CI environments. NodePort is simpler: the service is accessible on a
+#   fixed port (30080) on the Minikube node IP (`minikube ip`).
+#
+#   For cloud (EKS/AKS): change gateway.type to `LoadBalancer`.
+#   For CI (GitHub Actions): the Terraform ALB target group points at NodePort 30080
+#   on the Minikube node IP, bridging the gap between Minikube and the internet.
 # ============================================================
 
 apisix:
-  enabled: true
-  replicaCount: 1
+  enabled: true     # Enable the APISIX data plane (required — this is the gateway itself)
+  replicaCount: 1   # One replica is sufficient for dev/staging. Scale up for production HA.
 
   podAnnotations:
-    # Belt-and-suspenders: namespace label already enables Istio injection,
-    # but this annotation ensures APISIX pods are explicitly included.
-    # Without the Istio sidecar, APISIX traffic is not covered by the
-    # PeerAuthentication STRICT mTLS policy.
+    # Explicitly opt into Istio sidecar injection at the pod level.
+    # The gaas namespace label already enables injection, but this annotation
+    # ensures APISIX pods are covered even if someone removes the namespace label.
+    # Without the sidecar, APISIX traffic bypasses the STRICT mTLS policy —
+    # the gateway pod would be outside the Zero Trust boundary.
     sidecar.istio.io/inject: "true"
 
   resources:
+    # requests: what Kubernetes reserves on a node for this pod (affects scheduling)
     requests:
-      cpu: 200m
-      memory: 256Mi
+      cpu: 200m      # 0.2 CPU cores minimum — APISIX is event-driven and efficient
+      memory: 256Mi  # 256 MiB minimum
+    # limits: the hard ceiling — if APISIX exceeds this, the container is throttled/OOMKilled
     limits:
-      cpu: "1"
-      memory: 512Mi
+      cpu: "1"       # 1 full CPU core maximum
+      memory: 512Mi  # 512 MiB maximum
 
-  # APISIX admin API — protected, accessible only within the cluster
+  # APISIX Admin API — the control plane endpoint for configuring routes, plugins, consumers.
+  # This is how the APISIX Dashboard and the Ingress Controller communicate with APISIX.
   admin:
     enabled: true
-    type: ClusterIP
-    port: 9180
-    # Restrict admin access to cluster-internal traffic only
+    type: ClusterIP   # Admin API is NEVER exposed externally — cluster-internal only
+    port: 9180        # Admin API port (different from the data plane port 9080)
     allow:
+      # Whitelist only RFC 1918 private IP ranges (cluster-internal traffic).
+      # Any admin request from a public IP is rejected at the APISIX level,
+      # in addition to being blocked by Kubernetes NetworkPolicy.
       ipList:
-        - 127.0.0.1
-        - 10.0.0.0/8
-        - 172.16.0.0/12
-        - 192.168.0.0/16
+        - 127.0.0.1        # Loopback (within the same pod)
+        - 10.0.0.0/8       # Class A private range (most K8s pod CIDRs)
+        - 172.16.0.0/12    # Class B private range (Docker default bridge)
+        - 192.168.0.0/16   # Class C private range (Minikube default)
 
-# Gateway (data plane): the entry point for all tenant API traffic
+# Gateway: the data plane — this is the HTTP server that receives tenant API traffic
 gateway:
-  # NodePort for Minikube compatibility (see design decision above).
-  # Change to `LoadBalancer` when deploying to EKS/AKS with Terraform ALB.
+  # NodePort for Minikube (see design decision comment at top of this file).
+  # Change to `LoadBalancer` for EKS/AKS deployments.
   type: NodePort
   http:
     enabled: true
-    servicePort: 80
-    containerPort: 9080
-    nodePort: 30080  # Fixed port so Terraform ALB target group is stable
+    servicePort: 80    # The port exposed on the NodePort Service object
+    containerPort: 9080  # The port APISIX listens on inside the container
+    # Fixed NodePort number so the Terraform ALB target group doesn't drift.
+    # If this changes, update terraform/variables.tf apisix_node_port default too.
+    nodePort: 30080
   tls:
-    enabled: false   # TLS terminated at the ALB (Terraform) layer
+    # TLS is disabled at the APISIX level because TLS termination happens at the
+    # AWS ALB (managed by Terraform). The ALB decrypts HTTPS and forwards plain
+    # HTTP to APISIX NodePort 30080. APISIX → internal services use Istio mTLS.
+    enabled: false
 
-# Ingress controller: allows using standard Kubernetes Ingress resources
-# alongside APISIX-native ApisixRoute resources
+# Ingress Controller: watches for Kubernetes Ingress resources and ApisixRoute CRDs
+# and configures APISIX routes automatically. Without this, you'd have to manually
+# create routes via the APISIX admin API or Dashboard.
 ingress-controller:
   enabled: true
   config:
     apisix:
-      adminKey: "gaas-admin-key-change-me"  # Override via K8s Secret in CI
-      serviceNamespace: gaas
+      # The admin key protects the APISIX admin API from unauthorized access.
+      # This should be overridden via a Kubernetes Secret in CI — not left as a placeholder.
+      adminKey: "gaas-admin-key-change-me"
+      serviceNamespace: gaas   # The namespace where APISIX is deployed
 
-# Embedded etcd: acceptable for demo/dev — not HA
-# For production: point to an external etcd cluster or use APISIX's
-# standalone mode (etcd-less, config stored in SQLite)
+# etcd: APISIX uses etcd as its configuration store for routes, plugins, and consumers.
+# Changes made via the admin API are written to etcd and synced to all APISIX pods.
 etcd:
-  enabled: true
-  replicaCount: 1
+  enabled: true    # Use the embedded etcd (suitable for dev — not HA)
+  replicaCount: 1  # Single etcd node — fine for dev, NOT for production
   persistence:
-    enabled: false  # Ephemeral — acceptable for Minikube CI runs
+    # Ephemeral storage: etcd data is lost when the pod restarts.
+    # This is acceptable for Minikube and CI runs where the cluster is rebuilt each time.
+    # For production, set enabled: true and configure a StorageClass with persistent volumes.
+    enabled: false
 
-# Dashboard is disabled here and deployed separately via apisix-dashboard-config.yaml.
-# Reason: the dashboard has its own auth model and should be gated independently
-# from the data-plane gateway. Deploying it separately allows applying a
-# stricter NetworkPolicy to the dashboard pod.
+# Dashboard is deliberately disabled here.
+# It is deployed separately via apisix-dashboard-config.yaml with its own
+# Deployment, Service, and ConfigMap. This separation allows:
+#   1. Independent scaling (dashboard doesn't need to scale with the gateway)
+#   2. Stricter NetworkPolicy on the dashboard pod (e.g., only accessible from VPN)
+#   3. Different resource limits (the dashboard is a UI — much lower traffic)
 dashboard:
   enabled: false

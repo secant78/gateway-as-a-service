@@ -1,41 +1,91 @@
----
-# APISIX Consumer — GaaS JWT Authentication
 # ============================================================
-# The ApisixRoute in the tenant-app Helm chart references this consumer
-# via `key: "gaas-jwt"`. Without this resource, all requests to any
-# tenant route will fail with 401 "consumer not found".
+# APISIX Consumer — GaaS JWT Authentication Bridge
+# ============================================================
 #
-# This consumer configures APISIX's jwt-auth plugin to verify tokens
-# issued by the GaaS auth-service. The `secret` must match the HMAC
-# signing key stored in Vault at `secret/gaas/jwt-signing-key`.
+# PURPOSE:
+#   This resource connects APISIX's jwt-auth plugin to the JWT signing key
+#   managed by HashiCorp Vault. Without this, ALL requests to any tenant
+#   route would fail with HTTP 401 "consumer not found".
 #
-# Apply after APISIX is installed:
+# WHAT IS AN APISIX CONSUMER?
+#   In APISIX, a Consumer represents an identity that is ALLOWED to call APIs.
+#   The jwt-auth plugin works in two steps:
+#     1. The incoming request has an "Authorization: Bearer <JWT>" header
+#     2. APISIX looks up the Consumer whose `key` matches the JWT's `key` claim
+#     3. If found, APISIX validates the JWT signature using the Consumer's secret
+#     4. If valid, the request is forwarded to the upstream tenant service
+#     5. If no matching Consumer, APISIX returns 401 "consumer not found"
+#
+#   This Consumer (key: "gaas-jwt") is the single shared consumer for ALL
+#   tenant routes in the GaaS platform. Every JWT issued by the auth-service
+#   is validated against this consumer's HMAC secret.
+#
+# HOW IT CONNECTS TO THE AUTH SERVICE:
+#   The auth-service (JwtService.java) signs JWTs with an HMAC-SHA256 key loaded
+#   from Vault at `secret/data/gaas/jwt-signing-key`.
+#   APISIX's jwt-auth plugin verifies JWTs using the `secret` field in THIS consumer.
+#   For verification to succeed, both keys MUST be identical.
+#
+# HOW TO POPULATE THE SECRET:
+#   After bootstrapping Vault and writing the signing key, read it back:
+#     export SIGNING_KEY=$(vault kv get -field=value secret/gaas/jwt-signing-key)
+#   Then update this consumer (or apply a patched version of this file):
+#     kubectl patch apisixconsumer gaas-jwt -n gaas --type=json \
+#       -p='[{"op": "replace", "path": "/spec/authPlugin/config/secret", "value": "'$SIGNING_KEY'"}]'
+#
+# KEY ROTATION:
+#   When the CI pipeline rotates the signing key in Vault, the auth-service
+#   automatically picks up the new key (JwtService.scheduledKeyRotationCheck).
+#   You MUST also update this consumer to the new key value, otherwise APISIX
+#   will reject tokens signed with the new key.
+#
+#   In production, automate this via:
+#   1. A Kubernetes External Secrets Operator watching the Vault secret
+#   2. A post-rotation hook in the CI pipeline that patches this consumer
+#
+# APPLY ORDER:
 #   kubectl apply -f gaas/gateway/apisix-consumer.yaml
+#   (Apply AFTER APISIX is installed and running)
 #
-# On key rotation: update the secret field to the new signing key and
-# re-apply. APISIX will hot-reload the consumer without restart.
+# VERIFY:
+#   kubectl get apisixconsumer -n gaas
+#   → Should show `gaas-jwt` as Ready
 # ============================================================
 apiVersion: apisix.apache.org/v2
 kind: ApisixConsumer
 metadata:
-  name: gaas-jwt
+  name: gaas-jwt    # Must match the `key` field in ApisixRoute jwt-auth plugin config
   namespace: gaas
   labels:
     app.kubernetes.io/part-of: gaas
 spec:
   authPlugin:
-    name: jwt-auth
-    enable: true
+    name: jwt-auth    # References the built-in APISIX JWT authentication plugin
+    enable: true      # Plugin is active — set to false to temporarily disable JWT validation
     config:
-      # The key must match the `config.key` in the ApisixRoute jwt-auth plugin
+      # The consumer key — this is the identifier that APISIX uses to look up
+      # this consumer when it finds a JWT in the request's Authorization header.
+      # Every ApisixRoute's jwt-auth plugin specifies: config.key: "gaas-jwt"
+      # which tells APISIX to validate against THIS consumer's secret.
       key: "gaas-jwt"
-      # The HMAC secret must match the signing key in Vault.
-      # In production, inject this from a Kubernetes Secret instead of hardcoding:
-      #   kubectl create secret generic apisix-jwt-secret \
-      #     --from-literal=secret=<base64-decoded-signing-key> -n gaas
-      # Then reference it here via a SecretReference (requires APISIX 3.x+).
+
+      # HMAC signing secret — MUST match the value in Vault at secret/gaas/jwt-signing-key.
+      # This is the same key that JwtService.java uses to sign tokens.
+      # Replace this placeholder with the actual base64-decoded key value.
+      #
+      # PRODUCTION NOTE: Instead of hardcoding here, use one of:
+      #   Option A: APISIX Secret Reference (APISIX 3.x+):
+      #     secret: "$secret://kubernetes/apisix-jwt-secret/value"
+      #   Option B: External Secrets Operator syncing from Vault to a K8s Secret
+      #   Option C: CI pipeline patch command (see comments above)
       secret: "REPLACE_WITH_VAULT_SIGNING_KEY"
-      # Token expiry must be >= auth-service's gaas.jwt.expiry-seconds (3600)
+
+      # Token expiry in seconds. This is the maximum accepted lifetime of a JWT.
+      # Must be >= auth-service's gaas.jwt.expiry-seconds (3600).
+      # APISIX will reject tokens that are valid for longer than this value.
       exp: 3600
-      # Algorithm must match JwtService.java — HMAC-SHA256
+
+      # Signing algorithm — must match the algorithm used in JwtService.java.
+      # JwtService uses Keys.hmacShaKeyFor() which produces an HS256 key.
+      # HS256 = HMAC-SHA-256 (symmetric — same key to sign and verify)
       algorithm: "HS256"

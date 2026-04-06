@@ -1,6 +1,45 @@
+# ============================================================
+# Helm Template: Service + ApisixRoute
+# ============================================================
+#
+# PURPOSE:
+#   This file creates TWO Kubernetes resources:
+#   1. A ClusterIP Service — stable internal DNS name for the tenant's pods
+#   2. An ApisixRoute     — tells APISIX to route traffic to this tenant (optional)
+#
+# WHAT IS A KUBERNETES SERVICE?
+#   Pods have ephemeral IPs that change on every restart. A Service provides
+#   a stable virtual IP (ClusterIP) and DNS name that always routes to healthy pods.
+#   DNS format: <service-name>.<namespace>.svc.cluster.local:<port>
+#   Example: acme-corp-svc.tenant-acme.svc.cluster.local:8080
+#
+# WHAT IS AN APISIXROUTE?
+#   An ApisixRoute is a Kubernetes Custom Resource Definition (CRD) that tells
+#   the APISIX Ingress Controller how to configure APISIX routes.
+#   When the ingress controller sees this resource, it:
+#     1. Creates an APISIX route in etcd
+#     2. APISIX starts forwarding matching requests to the tenant's Service
+#     3. The jwt-auth plugin validates Bearer tokens on every request
+#
+#   The ApisixRoute is only rendered if .Values.apisixRoute.enabled = true (default).
+#   Set apisixRoute.enabled=false for internal-only services that should not
+#   be exposed through the APISIX gateway.
+#
+# JWT AUTH PLUGIN:
+#   The jwt-auth plugin in the ApisixRoute references consumer key "gaas-jwt".
+#   This connects to the ApisixConsumer in gateway/apisix-consumer.yaml.
+#   Every request to this tenant route MUST include:
+#     Authorization: Bearer <valid-JWT-from-auth-service>
+#   Invalid or missing tokens receive 401 Unauthorized.
+# ============================================================
+
+# ---- Service ----
+# ClusterIP Service: internal routing to tenant pods
 apiVersion: v1
 kind: Service
 metadata:
+  # Service name: <release-name>-svc (e.g., "acme-corp-svc")
+  # The ApisixRoute backend (below) references this name.
   name: {{ .Release.Name }}-svc
   namespace: {{ .Release.Namespace }}
   labels:
@@ -8,24 +47,31 @@ metadata:
     app.kubernetes.io/part-of: gaas
     gaas/tenant-id: {{ required "tenantId is required" .Values.tenantId | quote }}
 spec:
+  # Route traffic to pods that have the label: app: <release-name>
+  # This matches the pod template labels in deployment.yaml
   selector:
     app: {{ .Release.Name }}
   ports:
     - name: http
-      port: {{ .Values.service.port }}
-      targetPort: {{ .Values.service.port }}
+      port: {{ .Values.service.port }}        # Port that other services call (e.g., 8080)
+      targetPort: {{ .Values.service.port }}  # Port the pod container listens on
       protocol: TCP
+  # ClusterIP: the Service is only accessible from within the cluster.
+  # External traffic comes through APISIX (which is the only NodePort/LoadBalancer).
+  # This enforces that all external traffic goes through the JWT-validating gateway.
   type: {{ .Values.service.type }}
 
+# ---- ApisixRoute (conditional) ----
+# Only rendered if apisixRoute.enabled=true in values.yaml (the default).
+# This block is separated from the Service by --- to create a second YAML document.
 {{- if .Values.apisixRoute.enabled }}
 ---
-# ApisixRoute: configures APISIX to route traffic to this tenant's service.
-# The pathPrefix determines where in the APISIX gateway this tenant's APIs appear.
-# Example: pathPrefix "/tenants/acme-corp" exposes the tenant at
-#          http://<gateway>/tenants/acme-corp/*
+# ApisixRoute configures APISIX to forward matching HTTP requests to this tenant's Service.
+# The APISIX Ingress Controller watches for ApisixRoute CRDs and syncs them to APISIX.
 apiVersion: apisix.apache.org/v2
 kind: ApisixRoute
 metadata:
+  # Route name: <release-name>-route (e.g., "acme-corp-route")
   name: {{ .Release.Name }}-route
   namespace: {{ .Release.Namespace }}
   labels:
@@ -34,10 +80,16 @@ metadata:
     gaas/tenant-id: {{ .Values.tenantId | quote }}
 spec:
   http:
-    - name: tenant-route
+    - name: tenant-route   # Logical name for this route rule within APISIX
       match:
+        # Path match: forward any request whose URL starts with the tenant's path prefix.
+        # The /* wildcard matches anything after the prefix.
+        # Example: pathPrefix="/tenants/acme" matches:
+        #   /tenants/acme/products, /tenants/acme/orders/123, etc.
         paths:
           - {{ required "apisixRoute.pathPrefix is required when apisixRoute.enabled=true" .Values.apisixRoute.pathPrefix }}/*
+        # Allowed HTTP methods — all standard REST verbs.
+        # HEAD and OPTIONS are intentionally excluded (add them if your tenant needs CORS).
         methods:
           - GET
           - POST
@@ -45,12 +97,20 @@ spec:
           - DELETE
           - PATCH
       backends:
+        # Forward matched requests to the Service created above.
+        # serviceName MUST match the Service name (<release-name>-svc).
         - serviceName: {{ .Release.Name }}-svc
           servicePort: {{ .Values.service.port }}
       plugins:
-        # JWT verification plugin — validates tokens issued by the GaaS auth-service
+        # jwt-auth plugin: validates the Bearer token on every incoming request.
+        # Requests WITHOUT a valid JWT are rejected with 401 before reaching the backend.
+        # The `key: "gaas-jwt"` references the ApisixConsumer in apisix-consumer.yaml.
+        # APISIX looks up the Consumer by key and uses its secret to verify the signature.
         - name: jwt-auth
           enable: true
           config:
-            key: "gaas-jwt"  # References an APISIX Consumer configured with the public key
+            # This key value MUST match the ApisixConsumer's spec.authPlugin.config.key
+            # in gateway/apisix-consumer.yaml. If they don't match, ALL requests to
+            # this tenant route will fail with 401 "consumer not found".
+            key: "gaas-jwt"
 {{- end }}

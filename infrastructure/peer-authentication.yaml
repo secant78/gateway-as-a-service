@@ -1,30 +1,85 @@
----
-# PeerAuthentication enforces STRICT mTLS for all pod-to-pod communication
-# within the `gaas` namespace. In STRICT mode, Istio rejects any plaintext
-# (non-mTLS) inbound connection. Every pod must present a valid SPIFFE/SVID
-# X.509 certificate issued by the Istio CA — this is the Zero Trust boundary.
+# ============================================================
+# Istio PeerAuthentication — STRICT mTLS Zero Trust Policy
+# ============================================================
 #
-# If you need to temporarily allow plaintext from a legacy service (not recommended),
-# change mode to PERMISSIVE during a migration window, then revert to STRICT.
+# PURPOSE:
+#   Enforces mutual TLS (mTLS) for ALL pod-to-pod communication within
+#   the GaaS namespaces. This is the single most important security resource
+#   in the entire project — it is what creates the "Zero Trust" network.
+#
+# WHAT IS mTLS?
+#   Normal TLS (HTTPS): only the SERVER presents a certificate.
+#     Client: "Who are you?" → Server: "I'm gaas.internal, here's my cert"
+#
+#   mTLS (mutual TLS): BOTH sides present certificates.
+#     Client: "Who are you?" → Server: "I'm auth-service, here's my cert"
+#     Server: "Who are you?" → Client: "I'm apisix, here's my cert"
+#
+#   In Istio, these certificates are SPIFFE X.509 SVIDs — identities tied to
+#   Kubernetes ServiceAccounts, issued and rotated automatically by istiod (the
+#   Istio control plane). No manual certificate management is needed.
+#
+# WHAT IS STRICT MODE?
+#   mode: STRICT means Istio REJECTS any plaintext (non-mTLS) inbound connection.
+#   If a pod tries to connect to another pod without presenting a valid certificate,
+#   the receiving pod's Envoy sidecar drops the connection with a TLS error.
+#
+#   Alternative modes:
+#     PERMISSIVE: Accept both mTLS and plaintext — used during migration from
+#                 non-Istio to Istio. Safe to use during cutover.
+#     DISABLE:    No mTLS — only use for debugging, never in production.
+#
+# WHY THIS = ZERO TRUST:
+#   Traditional network security: "if traffic is inside the cluster, it's trusted"
+#   Zero Trust: "no traffic is trusted until it presents a valid identity"
+#
+#   With STRICT mTLS:
+#     ✓ auth-service can call Vault (both have Istio identities)
+#     ✗ A rogue process without an Istio identity cannot call Vault
+#     ✗ Traffic from outside the mesh cannot reach any pod directly
+#
+# HOW ENVOY HANDLES THIS TRANSPARENTLY:
+#   The application code (Spring Boot, Vault) knows NOTHING about mTLS.
+#   The Envoy sidecar handles the TLS handshake before traffic reaches
+#   the application. From the app's perspective, it's still plain HTTP.
+#
+# APPLY ORDER:
+#   This file MUST be applied AFTER namespace.yaml because the namespace
+#   must exist before a PeerAuthentication resource can be created in it.
+#   kubectl apply -f namespace.yaml
+#   kubectl apply -f peer-authentication.yaml   ← this file
+#
+# VERIFY mTLS IS WORKING:
+#   istioctl x check-inject -n gaas
+#   kubectl exec -n gaas <pod> -c istio-proxy -- pilot-agent request GET stats | grep ssl
+# ============================================================
+
+---
+# PeerAuthentication for the main GaaS workload namespace.
+# Covers: APISIX, auth-service, APISIX dashboard, all tenant app pods.
+# Every pod must present a valid SPIFFE identity to receive traffic.
 apiVersion: security.istio.io/v1beta1
 kind: PeerAuthentication
 metadata:
   name: gaas-strict-mtls
-  namespace: gaas
+  namespace: gaas   # Scoped to this namespace only (not cluster-wide)
 spec:
+  # No selector = applies to ALL pods in the namespace (namespace-wide policy).
+  # To scope to specific pods, add: selector: matchLabels: app: auth-service
   mtls:
-    mode: STRICT
+    mode: STRICT    # Reject ALL non-mTLS inbound connections
 
 ---
-# Vault namespace also enforces STRICT mTLS.
-# This means the auth-service calling Vault's API at port 8200 must have
-# a valid Istio identity. The Vault pod's sidecar handles the mTLS handshake
-# transparently — no changes to Vault's own TLS config are required.
+# PeerAuthentication for the Vault namespace.
+# Ensures that auth-service → Vault traffic (port 8200) is also mTLS-protected.
+# The Vault application itself doesn't need any TLS config changes —
+# Istio's Envoy sidecar intercepts the connection and handles mTLS transparently
+# before the traffic reaches Vault's listener.
 apiVersion: security.istio.io/v1beta1
 kind: PeerAuthentication
 metadata:
   name: vault-strict-mtls
-  namespace: gaas-vault
+  namespace: gaas-vault   # Scoped to the Vault namespace
 spec:
   mtls:
-    mode: STRICT
+    mode: STRICT    # Reject ALL non-mTLS inbound connections to Vault pods

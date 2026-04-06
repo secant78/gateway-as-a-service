@@ -1,16 +1,47 @@
+# ============================================================
+# Helm Template: Deployment
+# ============================================================
+#
+# PURPOSE:
+#   Creates a Kubernetes Deployment that runs the tenant's container image.
+#   A Deployment manages a ReplicaSet, which manages individual Pods.
+#   If a Pod crashes, the ReplicaSet automatically replaces it.
+#
+# HELM TEMPLATING SYNTAX:
+#   {{ .Release.Name }}    — the Helm release name (e.g., "acme-corp")
+#   {{ .Release.Namespace }} — the Kubernetes namespace for this release
+#   {{ .Values.foo }}      — a value from values.yaml (overridable at install time)
+#   {{ required "msg" val }} — fails the install with "msg" if val is empty
+#   {{- with .Values.foo }} — conditional block: only renders if .Values.foo is not empty
+#   {{- toYaml . | nindent 8 }} — converts a map/list to YAML, indented 8 spaces
+#
+# SECURITY FEATURES IN THIS TEMPLATE:
+#   runAsNonRoot: true       — the container process cannot run as root (UID 0)
+#   allowPrivilegeEscalation: false — the process cannot gain more privileges than its parent
+#   capabilities.drop: [ALL] — removes ALL Linux capabilities (none needed for a web app)
+#   seccompProfile: RuntimeDefault — applies the container runtime's default syscall filter
+# ============================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  # Release name becomes the Deployment name — unique per tenant since each tenant
+  # uses a different Helm release name (e.g., helm install acme-corp ./tenant-app)
   name: {{ .Release.Name }}
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: {{ .Release.Name }}
     app.kubernetes.io/part-of: gaas
+    # tenantId is required — if not provided at install time, helm install fails immediately
+    # with the message "tenantId is required". This prevents accidental unlabeled deployments.
     gaas/tenant-id: {{ required "tenantId is required" .Values.tenantId | quote }}
 spec:
+  # replicaCount from values.yaml (default 1) — how many pod replicas to run.
+  # For production tenants, increase to 2+ for high availability.
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
+      # The Deployment uses this label to find which pods belong to it.
+      # Must match the labels in template.metadata.labels below.
       app: {{ .Release.Name }}
   template:
     metadata:
@@ -19,43 +50,75 @@ spec:
         app.kubernetes.io/name: {{ .Release.Name }}
         app.kubernetes.io/part-of: gaas
         gaas/tenant-id: {{ .Values.tenantId | quote }}
+        # Merge any additional pod labels from values.yaml (e.g., monitoring labels)
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
+        # Merge pod annotations from values.yaml.
+        # By default, values.yaml includes sidecar.istio.io/inject: "true"
+        # to ensure Istio sidecar is always injected for tenant pods.
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      # Assign the dedicated ServiceAccount created by serviceaccount.yaml.
+      # This gives the tenant pod a Kubernetes identity scoped to its own namespace.
+      # If no custom name is set in values, defaults to <release-name>-sa.
       serviceAccountName: {{ default (printf "%s-sa" .Release.Name) .Values.serviceAccount.name }}
-      # Prevent privilege escalation by the container process
+
+      # Pod-level security context — applies to all containers in this pod.
       securityContext:
+        # Force all containers to run as non-root. If an image has USER root,
+        # Kubernetes will refuse to start the pod (fail-fast, better than runtime risk).
         runAsNonRoot: true
+        # Apply the container runtime's default seccomp (system call) filter.
+        # This blocks dangerous syscalls (like reboot, mount, ptrace) that a
+        # compromised application should never need.
         seccompProfile:
           type: RuntimeDefault
+
       containers:
         - name: {{ .Release.Name }}
+          # image.repository is REQUIRED — helm install fails if not provided.
+          # The colon-separated tag is either "latest" or a specific version.
           image: {{ required "image.repository is required" .Values.image.repository }}:{{ .Values.image.tag }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
+            # Expose the container's HTTP port — must match what the app listens on.
+            # Default is 8080 (values.yaml service.port). Tenants can override this.
             - containerPort: {{ .Values.service.port }}
               name: http
+          # Apply per-container resource limits from values.yaml.
+          # These are enforced by the kubelet on the node.
+          # The ResourceQuota template enforces namespace-level limits on top of these.
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          # Container-level security context — more granular than pod-level.
           securityContext:
+            # Prevent the container process from gaining elevated privileges (e.g., via setuid).
+            # Even if the image contains setuid binaries, they cannot escalate privileges.
             allowPrivilegeEscalation: false
             capabilities:
+              # Drop ALL Linux capabilities. A typical web service needs none of them.
+              # This prevents container breakout exploits that rely on capabilities like
+              # CAP_NET_ADMIN, CAP_SYS_PTRACE, or CAP_DAC_OVERRIDE.
               drop:
                 - ALL
+          # Readiness probe: Kubernetes stops sending traffic to this pod while it's not ready.
+          # The pod is "not ready" until this returns HTTP 200.
+          # Common use case: during startup, the app may not be ready to serve traffic yet.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /health     # The tenant app must expose a /health endpoint
               port: {{ .Values.service.port }}
-            initialDelaySeconds: 10
-            periodSeconds: 5
+            initialDelaySeconds: 10   # Wait 10s after container start before checking
+            periodSeconds: 5          # Check every 5 seconds
+          # Liveness probe: Kubernetes RESTARTS the pod if this fails repeatedly.
+          # Use this to recover from deadlocks or hung processes.
           livenessProbe:
             httpGet:
               path: /health
               port: {{ .Values.service.port }}
-            initialDelaySeconds: 20
-            periodSeconds: 10
+            initialDelaySeconds: 20   # Wait longer than readiness (give app more startup time)
+            periodSeconds: 10         # Check every 10 seconds

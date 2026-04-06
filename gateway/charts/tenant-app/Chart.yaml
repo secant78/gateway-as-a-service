@@ -1,14 +1,49 @@
-apiVersion: v2
-name: tenant-app
-version: 0.1.0
-appVersion: "1.0"
+# ============================================================
+# Helm Chart Metadata — tenant-app
+# ============================================================
+#
+# PURPOSE:
+#   This file is the identity card for the tenant-app Helm chart.
+#   Helm reads it to know the chart's name, version, and type.
+#
+# WHAT IS A HELM CHART?
+#   A Helm chart is a package of pre-configured Kubernetes resources.
+#   Instead of maintaining 6 separate YAML files per tenant, the platform team
+#   maintains ONE chart and operators deploy it once per tenant with:
+#     helm install <tenant-release-name> ./tenant-app \
+#       --set tenantId=acme-corp \
+#       --set image.repository=gcr.io/acme/api
+#
+# WHAT THIS CHART CREATES PER TENANT:
+#   - Deployment      — runs the tenant's container image
+#   - ServiceAccount  — gives the tenant pods a Kubernetes identity
+#   - Role            — namespace-scoped RBAC permissions (read-only by default)
+#   - RoleBinding     — connects the Role to the ServiceAccount
+#   - ResourceQuota   — enforces CPU/memory limits at namespace level
+#   - Service         — stable DNS name for the tenant's pods
+#   - ApisixRoute     — configures APISIX to route traffic with JWT validation
+#
+# VERSIONING:
+#   version:    The chart version (increment when chart templates change)
+#   appVersion: The application version (informational — the deployed app's version)
+#
+# HELM CHART API VERSIONS:
+#   apiVersion: v2 is required for Helm 3 features (library charts, chart dependencies).
+#   apiVersion: v1 is legacy (Helm 2 compatible).
+#   Always use v2 for new charts.
+# ============================================================
+
+apiVersion: v2          # Helm 3 chart format (required for modern Helm features)
+name: tenant-app        # The chart name — used in: helm install <name> ./tenant-app
+version: 0.1.0          # Chart version — increment when templates or values.yaml change
+appVersion: "1.0"       # Application version — informational, shown in `helm list`
 description: >
   Standardized Helm chart for GaaS Tenant Application deployments.
   Provides pre-configured RBAC (namespace-scoped Role + RoleBinding),
   dedicated ServiceAccount, and enforced resource limits via ResourceQuota.
   Tenants are isolated by namespace — one Helm release per tenant namespace.
 
-type: application
+type: application       # application = deploys workloads; library = shared helpers only
 
 keywords:
   - gaas

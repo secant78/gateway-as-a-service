@@ -1,27 +1,73 @@
+# ============================================================
+# GaaS Kubernetes Namespaces
+# ============================================================
+#
+# PURPOSE:
+#   Creates the two logical namespaces that all GaaS components live in.
+#   Namespaces in Kubernetes are the primary unit of multi-tenant isolation —
+#   they scope resources, RBAC permissions, and network policies.
+#
+# WHY TWO NAMESPACES?
+#   `gaas`:       All primary workloads — APISIX gateway, auth-service,
+#                 tenant application deployments, APISIX dashboard.
+#
+#   `gaas-vault`: HashiCorp Vault runs here in ISOLATION from the main workloads.
+#                 This is called "blast radius containment":
+#                 If a workload in `gaas` is compromised, the attacker must
+#                 also break out of the namespace boundary to reach Vault.
+#                 Kubernetes NetworkPolicy can enforce this boundary at the
+#                 network layer (block all gaas → gaas-vault traffic except
+#                 from auth-service on port 8200).
+#
+# ISTIO INJECTION LABEL:
+#   The label `istio-injection: enabled` instructs Istio's MutatingWebhookAdmissionController
+#   (installed when Istio is set up) to automatically inject an Envoy sidecar proxy
+#   container into EVERY Pod created in this namespace.
+#
+#   The Envoy sidecar intercepts ALL inbound and outbound traffic for the pod.
+#   This is how Istio implements:
+#     - mTLS (the sidecar handles TLS handshakes transparently)
+#     - Traffic management (routing rules, circuit breakers)
+#     - Observability (request metrics, distributed tracing)
+#
+#   CRITICAL: This label MUST be applied BEFORE any pods are scheduled here.
+#   The injection happens at pod CREATION time via an admission webhook.
+#   Existing pods will NOT get the sidecar injected retroactively —
+#   you would need to restart them (delete the pod, the ReplicaSet recreates it).
+#
+# HOW TO APPLY:
+#   kubectl apply -f namespace.yaml
+#   (Always apply this before peer-authentication.yaml and before any workloads)
+#
+# HOW TO VERIFY INJECTION IS WORKING:
+#   kubectl get pods -n gaas
+#   → Look for 2/2 READY (1 app container + 1 Envoy sidecar = 2 containers per pod)
+# ============================================================
+
 ---
-# Namespace for all GaaS core workloads.
-# The istio-injection label causes the Istio control plane to automatically
-# inject the Envoy sidecar proxy into every Pod created in this namespace.
-# This label MUST be present before any Pods are scheduled here, because
-# injection happens at admission time — existing Pods are not retroactively injected.
+# Primary GaaS namespace — all gateway, auth, and tenant workloads
 apiVersion: v1
 kind: Namespace
 metadata:
   name: gaas
   labels:
+    # This label triggers automatic Envoy sidecar injection for every pod in this namespace.
+    # Without it, pods have no sidecar and bypass the mTLS policy entirely.
     istio-injection: enabled
+    # Standard Kubernetes recommended label for grouping related resources
     app.kubernetes.io/part-of: gaas
     environment: production
 
 ---
-# Vault runs in its own namespace to limit blast radius.
-# A compromised workload in `gaas` cannot directly access Vault's API
-# without crossing a namespace boundary guarded by NetworkPolicy.
+# Vault namespace — isolated from gaas to limit blast radius
 apiVersion: v1
 kind: Namespace
 metadata:
   name: gaas-vault
   labels:
+    # Vault pods also get the Istio sidecar so that auth-service → Vault
+    # communication is covered by STRICT mTLS (see peer-authentication.yaml).
+    # Vault itself doesn't need to know about mTLS — the sidecar handles it transparently.
     istio-injection: enabled
     app.kubernetes.io/part-of: gaas
     environment: production

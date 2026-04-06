@@ -1,10 +1,54 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================
+  Maven Project Object Model (POM) — GaaS Auth Service
+  ============================================================
+
+  PURPOSE:
+    This file is Maven's build configuration. It defines:
+      - What this project is (groupId, artifactId, version)
+      - What libraries it depends on (dependencies)
+      - How to build it (plugins)
+
+  WHAT IS MAVEN?
+    Maven is a Java build tool. Running `mvn clean package` reads this file,
+    downloads all listed dependencies from Maven Central into ~/.m2/repository,
+    compiles the Java source files, runs tests, and produces a fat JAR in /target.
+
+  SPRING BOOT PARENT POM:
+    Inheriting from spring-boot-starter-parent does a lot of work for us:
+      - Manages versions for ALL Spring dependencies (no version conflicts)
+      - Configures the Maven compiler for Java 21
+      - Sets sensible defaults for resources, testing, and packaging
+      - Configures spring-boot-maven-plugin for building executable JARs
+
+  DEPENDENCY STRUCTURE:
+    The three-layer model used here:
+      spring-boot-starter-web      → Tomcat + Spring MVC (HTTP layer)
+      spring-boot-starter-security → Spring Security filter chain
+      jjwt-api + jjwt-impl + jjwt-jackson → JWT creation and signing
+      spring-vault-core            → HashiCorp Vault client
+      spring-boot-starter-actuator → /health, /info endpoints for K8s probes
+  ============================================================
+-->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
          https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <!-- POM format version — always 4.0.0 for Maven 2+ -->
     <modelVersion>4.0.0</modelVersion>
 
+    <!--
+      PARENT POM: Spring Boot Starter Parent
+      By inheriting from this parent, we get:
+        - Dependency version management (no need to specify versions for spring-* deps)
+        - Maven compiler plugin configured for Java 21
+        - spring-boot-maven-plugin pre-configured
+        - UTF-8 source encoding
+      The <relativePath/> tag tells Maven not to look for the parent in the local
+      filesystem — always fetch it from Maven Central.
+    -->
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
@@ -12,37 +56,70 @@
         <relativePath/>
     </parent>
 
-    <groupId>com.gaas</groupId>
-    <artifactId>auth-service</artifactId>
-    <version>1.0.0</version>
+    <!-- Project coordinates — uniquely identifies this artifact in Maven Central -->
+    <groupId>com.gaas</groupId>       <!-- organization/team namespace -->
+    <artifactId>auth-service</artifactId>  <!-- project name -->
+    <version>1.0.0</version>          <!-- semantic version -->
     <name>GaaS Auth Service</name>
     <description>
         Mock authorization server for GaaS that issues JWTs via the
         OAuth 2.0 Client Credentials Grant flow. Signing keys are
         managed by HashiCorp Vault and rotated automatically.
     </description>
+    <!-- jar: produces an executable fat JAR (not a WAR for deployment to app servers) -->
     <packaging>jar</packaging>
 
+    <!--
+      Version properties — centralizing version strings here means you only
+      update one place when upgrading. The ${jjwt.version} syntax is Maven
+      property interpolation — it substitutes the value at build time.
+    -->
     <properties>
-        <java.version>21</java.version>
-        <jjwt.version>0.12.5</jjwt.version>
-        <spring-vault.version>3.1.1</spring-vault.version>
+        <java.version>21</java.version>             <!-- requires JDK 21 -->
+        <jjwt.version>0.12.5</jjwt.version>         <!-- JJWT library for JWT creation -->
+        <spring-vault.version>3.1.1</spring-vault.version>  <!-- Spring Vault for Vault integration -->
     </properties>
 
     <dependencies>
-        <!-- Web layer -->
+
+        <!--
+          spring-boot-starter-web
+          Pulls in: embedded Tomcat, Spring MVC, Jackson (JSON serialization)
+          This is what makes @RestController and @PostMapping work, and what
+          starts the HTTP server on port 8081.
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
+            <!-- No <version> — managed by parent POM -->
         </dependency>
 
-        <!-- Security -->
+        <!--
+          spring-boot-starter-security
+          Pulls in: Spring Security filter chain, password encoding utilities
+          This is what makes @EnableWebSecurity and SecurityFilterChain work.
+          It automatically protects all endpoints until we explicitly configure
+          which ones are public in SecurityConfig.java.
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-security</artifactId>
         </dependency>
 
-        <!-- JWT issuance -->
+        <!--
+          JJWT (Java JWT) — three artifacts always used together:
+
+          jjwt-api: The public API — Jwts.builder(), JwtException, Claims, etc.
+                    This is what your code imports and compiles against.
+
+          jjwt-impl: The implementation (runtime scope) — the actual signing and
+                     parsing logic. Runtime scope means it's on the classpath at
+                     runtime but NOT at compile time, enforcing API/impl separation.
+
+          jjwt-jackson: The Jackson JSON provider (runtime scope) — JJWT uses
+                        Jackson to serialize/deserialize JWT claims. Without this,
+                        you get a runtime error: "No JSON provider found".
+        -->
         <dependency>
             <groupId>io.jsonwebtoken</groupId>
             <artifactId>jjwt-api</artifactId>
@@ -61,39 +138,73 @@
             <scope>runtime</scope>
         </dependency>
 
-        <!-- Vault integration for signing key management -->
+        <!--
+          spring-vault-core
+          Spring Vault is the Spring-native client for HashiCorp Vault.
+          It provides VaultTemplate (similar to JdbcTemplate but for Vault),
+          auto-configuration from spring.cloud.vault.* properties, and
+          support for Vault's token, AppRole, and Kubernetes auth methods.
+          Used in JwtService to read and monitor the JWT signing key.
+        -->
         <dependency>
             <groupId>org.springframework.vault</groupId>
             <artifactId>spring-vault-core</artifactId>
             <version>${spring-vault.version}</version>
         </dependency>
 
-        <!-- Actuator for health/readiness probes -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-actuator</artifactId>
-        </dependency>
-
-        <!-- Test -->
+        <!--
+          spring-boot-starter-actuator
+          Exposes operational endpoints over HTTP:
+            GET /actuator/health → {"status": "UP"} — used by Kubernetes liveness/readiness probes
+            GET /actuator/info   → build metadata
+          Without this dependency, Kubernetes probes would get 404 responses
+          and the pod would be marked as unhealthy and restarted.
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!--
+          spring-security-test
+          Provides @WithMockUser, mockMvc security testing utilities.
+          scope=test means it's ONLY on the classpath during `mvn test`,
+          not in the final JAR — no test code ships to production.
+        -->
         <dependency>
             <groupId>org.springframework.security</groupId>
             <artifactId>spring-security-test</artifactId>
             <scope>test</scope>
         </dependency>
+
     </dependencies>
 
     <build>
         <plugins>
+            <!--
+              spring-boot-maven-plugin
+              This plugin adds the `mvn spring-boot:run` goal and the
+              repackage goal that transforms the regular JAR into an
+              executable "fat JAR" containing all dependencies.
+
+              Without this plugin:
+                java -jar target/auth-service-1.0.0.jar
+                → Error: Unable to access jarfile (missing embedded Tomcat)
+
+              With this plugin:
+                java -jar target/auth-service-1.0.0.jar
+                → Spring Boot starts successfully with all deps bundled
+
+              The excludes block prevents lombok (a code generation tool)
+              from being included in the fat JAR — it's only needed at
+              compile time, not runtime. We don't currently use lombok but
+              this exclusion is a safe default for future additions.
+            -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
-                    <!-- Produces a self-contained executable JAR -->
                     <excludes>
                         <exclude>
                             <groupId>org.projectlombok</groupId>
@@ -104,4 +215,5 @@
             </plugin>
         </plugins>
     </build>
+
 </project>
